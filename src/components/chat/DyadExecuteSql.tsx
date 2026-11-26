@@ -1,15 +1,22 @@
 import type React from "react";
 import type { ReactNode } from "react";
-import { useState } from "react";
-import {
-  ChevronsDownUp,
-  ChevronsUpDown,
-  Database,
-  Loader,
-  CircleX,
-} from "lucide-react";
+import { Children, useMemo, useState } from "react";
+import { AlertTriangle, Database } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { CodeHighlight } from "./CodeHighlight";
 import { CustomTagState } from "./stateTypes";
+import {
+  DyadCard,
+  DyadCardHeader,
+  DyadBadge,
+  DyadExpandIcon,
+  DyadStateIndicator,
+  DyadCardContent,
+} from "./DyadCardPrimitives";
+import {
+  doesSqlDeleteData,
+  doesSqlMutateSchema,
+} from "@/lib/sqlSchemaMutation";
 
 interface DyadExecuteSqlProps {
   children?: ReactNode;
@@ -17,69 +24,75 @@ interface DyadExecuteSqlProps {
   description?: string;
 }
 
+function extractSqlText(children: ReactNode): string {
+  if (typeof children === "string") return children;
+  return Children.toArray(children)
+    .map((child) => (typeof child === "string" ? child : ""))
+    .join("");
+}
+
 export const DyadExecuteSql: React.FC<DyadExecuteSqlProps> = ({
   children,
   node,
   description,
 }) => {
+  const { t } = useTranslation("chat");
   const [isContentVisible, setIsContentVisible] = useState(false);
   const state = node?.properties?.state as CustomTagState;
   const inProgress = state === "pending";
   const aborted = state === "aborted";
   const queryDescription = description || node?.properties?.description;
+  const sqlText = extractSqlText(children);
+  const sqlMutatesSchema = useMemo(
+    () => (sqlText ? doesSqlMutateSchema(sqlText) : false),
+    [sqlText],
+  );
+  const sqlDeletesData = useMemo(
+    () => (sqlText ? doesSqlDeleteData(sqlText) : false),
+    [sqlText],
+  );
 
   return (
-    <div
-      className={`bg-(--background-lightest) hover:bg-(--background-lighter) rounded-lg px-4 py-2 border my-2 cursor-pointer ${
-        inProgress
-          ? "border-amber-500"
-          : aborted
-            ? "border-red-500"
-            : "border-border"
-      }`}
+    <DyadCard
+      state={state}
+      accentColor="teal"
+      isExpanded={isContentVisible}
       onClick={() => setIsContentVisible(!isContentVisible)}
     >
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <Database size={16} />
-          <span className="text-gray-700 dark:text-gray-300 font-medium text-sm">
-            <span className="font-bold mr-2 outline-2 outline-gray-200 dark:outline-gray-700 bg-gray-100 dark:bg-gray-800 rounded-md px-1">
-              SQL
-            </span>
+      <DyadCardHeader icon={<Database size={15} />} accentColor="teal">
+        <DyadBadge color="teal">SQL</DyadBadge>
+        {sqlMutatesSchema && (
+          <span className="inline-flex items-center gap-1 text-xs font-medium text-amber-700 dark:text-amber-400">
+            <AlertTriangle className="h-3.5 w-3.5 flex-shrink-0" />
+            {t("changesDatabaseSchema")}
+          </span>
+        )}
+        {sqlDeletesData && (
+          <span className="inline-flex items-center gap-1 text-xs font-medium text-red-700 dark:text-red-400">
+            <AlertTriangle className="h-3.5 w-3.5 flex-shrink-0" />
+            {t("destructiveDataChange")}
+          </span>
+        )}
+        {queryDescription && (
+          <span className="font-medium text-sm text-foreground truncate">
             {queryDescription}
           </span>
-          {inProgress && (
-            <div className="flex items-center text-amber-600 text-xs">
-              <Loader size={14} className="mr-1 animate-spin" />
-              <span>Executing...</span>
-            </div>
-          )}
-          {aborted && (
-            <div className="flex items-center text-red-600 text-xs">
-              <CircleX size={14} className="mr-1" />
-              <span>Did not finish</span>
-            </div>
-          )}
+        )}
+        {inProgress && (
+          <DyadStateIndicator state="pending" pendingLabel="Executing..." />
+        )}
+        {aborted && (
+          <DyadStateIndicator state="aborted" abortedLabel="Did not finish" />
+        )}
+        <div className="ml-auto">
+          <DyadExpandIcon isExpanded={isContentVisible} />
         </div>
-        <div className="flex items-center">
-          {isContentVisible ? (
-            <ChevronsDownUp
-              size={20}
-              className="text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
-            />
-          ) : (
-            <ChevronsUpDown
-              size={20}
-              className="text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
-            />
-          )}
-        </div>
-      </div>
-      {isContentVisible && (
+      </DyadCardHeader>
+      <DyadCardContent isExpanded={isContentVisible}>
         <div className="text-xs">
           <CodeHighlight className="language-sql">{children}</CodeHighlight>
         </div>
-      )}
-    </div>
+      </DyadCardContent>
+    </DyadCard>
   );
 };

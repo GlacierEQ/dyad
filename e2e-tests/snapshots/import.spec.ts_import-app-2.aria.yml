@@ -1,8 +1,8 @@
-- paragraph: /Generate an AI_RULES\.md file for this app\. Describe the tech stack in 5-\d+ bullet points and describe clear rules about what libraries to use for what\./
-- img
-- text: file1.txt
-- img
-- text: file1.txt
+- button "Restore to this point"
+- paragraph: "[[AI_RULES_GENERATION_PROMPT]]"
+- button "file1.txt file1.txt Edit"
 - paragraph: More EOM
-- button "Retry":
-  - img
+- button "Copy"
+- text: "[[Version 2: files changed]]"
+- button "Undo"
+- button "Retry"

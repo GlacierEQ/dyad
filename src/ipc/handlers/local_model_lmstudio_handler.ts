@@ -1,12 +1,21 @@
-import { ipcMain } from "electron";
 import log from "electron-log";
-import type { LocalModelListResponse, LocalModel } from "../ipc_types";
-import { LM_STUDIO_BASE_URL } from "../utils/lm_studio_utils";
+import { getLmStudioBaseUrl } from "../utils/lm_studio_utils";
+import { createTypedHandler } from "./base";
+import { languageModelContracts } from "../types/language-model";
+import type { LocalModel } from "../types/language-model";
+import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
 
 const logger = log.scope("lmstudio_handler");
 
+// LM Studio's /api/v0/models endpoint returns both generative models and
+// embedding models. Only generative models can be used for chat, so the
+// embedding types are excluded. Excluding non-chat types (rather than
+// allow-listing "llm") keeps multimodal/vision models such as "vlm" usable
+// and lets future chat-capable types surface without another code change.
+const NON_CHAT_LM_STUDIO_MODEL_TYPES = new Set(["embeddings", "embedding"]);
+
 export interface LMStudioModel {
-  type: "llm" | "embedding" | string;
+  type: "llm" | "vlm" | "embeddings" | string;
   id: string;
   object: string;
   publisher: string;
@@ -18,18 +27,21 @@ export interface LMStudioModel {
   [key: string]: any;
 }
 
-export async function fetchLMStudioModels(): Promise<LocalModelListResponse> {
+export async function fetchLMStudioModels(): Promise<{ models: LocalModel[] }> {
   const modelsResponse: Response = await fetch(
-    `${LM_STUDIO_BASE_URL}/api/v0/models`,
+    `${getLmStudioBaseUrl()}/api/v0/models`,
   );
   if (!modelsResponse.ok) {
-    throw new Error("Failed to fetch models from LM Studio");
+    throw new DyadError(
+      "Failed to fetch models from LM Studio",
+      DyadErrorKind.External,
+    );
   }
   const modelsJson = await modelsResponse.json();
   const downloadedModels = modelsJson.data as LMStudioModel[];
   const models: LocalModel[] = downloadedModels
-    .filter((model: any) => model.type === "llm")
-    .map((model: any) => ({
+    .filter((model) => !NON_CHAT_LM_STUDIO_MODEL_TYPES.has(model.type))
+    .map((model) => ({
       modelName: model.id,
       displayName: model.id,
       provider: "lmstudio",
@@ -40,10 +52,7 @@ export async function fetchLMStudioModels(): Promise<LocalModelListResponse> {
 }
 
 export function registerLMStudioHandlers() {
-  ipcMain.handle(
-    "local-models:list-lmstudio",
-    async (): Promise<LocalModelListResponse> => {
-      return fetchLMStudioModels();
-    },
-  );
+  createTypedHandler(languageModelContracts.listLMStudioModels, async () => {
+    return fetchLMStudioModels();
+  });
 }

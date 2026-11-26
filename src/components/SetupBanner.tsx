@@ -1,352 +1,360 @@
+import { useTranslation } from "react-i18next";
 import { useNavigate } from "@tanstack/react-router";
 import {
+  CircleCheck,
   ChevronRight,
   GiftIcon,
-  Sparkles,
-  CheckCircle,
-  AlertCircle,
-  XCircle,
-  Loader2,
+  Play,
   Settings,
 } from "lucide-react";
+import { useFirstPromptSaga } from "@/first_prompt/FirstPromptProvider";
 import { providerSettingsRoute } from "@/routes/settings/providers/$provider";
-import { settingsRoute } from "@/routes/settings";
+import { SECTION_IDS } from "@/lib/settingsSearchIndex";
 
-import { useState, useEffect, useCallback } from "react";
-import { IpcClient } from "@/ipc/ipc_client";
-import {
-  Accordion,
-  AccordionContent,
-  AccordionItem,
-  AccordionTrigger,
-} from "@/components/ui/accordion";
+import SetupProviderCard from "@/components/SetupProviderCard";
+
+import { ipc } from "@/ipc/types";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { NodeSystemInfo } from "@/ipc/ipc_types";
 import { usePostHog } from "posthog-js/react";
 import { useLanguageModelProviders } from "@/hooks/useLanguageModelProviders";
-type NodeInstallStep =
-  | "install"
-  | "waiting-for-continue"
-  | "continue-processing"
-  | "finished-checking";
+import { useScrollAndNavigateTo } from "@/hooks/useScrollAndNavigateTo";
+// @ts-ignore
+import logo from "../../assets/logo.svg";
+// @ts-ignore
+import openrouterLogo from "../../assets/ai-logos/openrouter-logo.png";
+import { SetupDyadProButton } from "./ProBanner";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useSubscriptionAccount } from "@/hooks/useSubscriptionAccount";
+import { useSettings } from "@/hooks/useSettings";
+import { isDyadProEnabled } from "@/lib/schemas";
+import { queryKeys } from "@/lib/queryKeys";
+import { ProviderIcon } from "./ProviderIcon";
 
-export function SetupBanner() {
+export function SetupBanner({
+  variant = "inline",
+  forceShow = false,
+}: {
+  variant?: "inline" | "dialog";
+  forceShow?: boolean;
+}) {
+  const { t } = useTranslation("home");
   const posthog = usePostHog();
   const navigate = useNavigate();
+  const client = useQueryClient();
+  const subscription = useSubscriptionAccount();
+  const { settings } = useSettings();
+  const hasPro = settings && isDyadProEnabled(settings);
+  const connection = useMutation({
+    mutationFn: (cancel: boolean) =>
+      cancel
+        ? ipc.settings.disconnectCodexSubscription()
+        : ipc.settings.connectCodexSubscription({
+            acceptCharges: true,
+            selectModel: !hasPro,
+          }),
+    onSuccess: async () => {
+      await client.invalidateQueries({ queryKey: queryKeys.settings.all });
+    },
+  });
+  const { hasArmedPayload: hasPendingPrompt } = useFirstPromptSaga();
   const { isAnyProviderSetup, isLoading: loading } =
     useLanguageModelProviders();
-  const [nodeSystemInfo, setNodeSystemInfo] = useState<NodeSystemInfo | null>(
-    null,
-  );
-  const [nodeCheckError, setNodeCheckError] = useState<boolean>(false);
-  const [nodeInstallStep, setNodeInstallStep] =
-    useState<NodeInstallStep>("install");
-  const checkNode = useCallback(async () => {
-    try {
-      setNodeCheckError(false);
-      const status = await IpcClient.getInstance().getNodejsStatus();
-      setNodeSystemInfo(status);
-    } catch (error) {
-      console.error("Failed to check Node.js status:", error);
-      setNodeSystemInfo(null);
-      setNodeCheckError(true);
-    }
-  }, [setNodeSystemInfo, setNodeCheckError]);
 
-  useEffect(() => {
-    checkNode();
-  }, [checkNode]);
+  const settingsScrollAndNavigateTo = useScrollAndNavigateTo("/settings", {
+    behavior: "smooth",
+    block: "start",
+  });
 
-  const handleAiSetupClick = () => {
-    posthog.capture("setup-flow:ai-provider-setup:google:click");
+  const handleSubscriptionSetupClick = () => {
+    posthog.capture("setup-flow:ai-provider-setup:chatgpt:click");
+    connection.mutate(false);
+  };
+
+  const handleOpenRouterSetupClick = () => {
+    posthog.capture("setup-flow:ai-provider-setup:openrouter:click");
     navigate({
       to: providerSettingsRoute.id,
-      params: { provider: "google" },
+      params: { provider: "openrouter" },
     });
+  };
+  const handleDyadProSetupClick = () => {
+    posthog.capture("setup-flow:ai-provider-setup:dyad:click");
+    ipc.system.openExternalUrl(
+      "https://academy.dyad.sh/redirect-to-checkout?trialCode=7PRO30&utm_source=dyad-app&utm_medium=app&utm_campaign=setup-dialog-v2",
+    );
   };
 
   const handleOtherProvidersClick = () => {
     posthog.capture("setup-flow:ai-provider-setup:other:click");
-    navigate({
-      to: settingsRoute.id,
-    });
+    settingsScrollAndNavigateTo(SECTION_IDS.providers);
   };
 
-  const handleNodeInstallClick = useCallback(async () => {
-    posthog.capture("setup-flow:start-node-install-click");
-    setNodeInstallStep("waiting-for-continue");
-    IpcClient.getInstance().openExternalUrl(nodeSystemInfo!.nodeDownloadUrl);
-  }, [nodeSystemInfo, setNodeInstallStep]);
-
-  const finishNodeInstall = useCallback(async () => {
-    posthog.capture("setup-flow:continue-node-install-click");
-    setNodeInstallStep("continue-processing");
-    await IpcClient.getInstance().reloadEnvPath();
-    await checkNode();
-    setNodeInstallStep("finished-checking");
-  }, [checkNode, setNodeInstallStep]);
-
-  // We only check for node version because pnpm is not required for the app to run.
-  const isNodeSetupComplete = Boolean(nodeSystemInfo?.nodeVersion);
+  const hasProviderSetup = isAnyProviderSetup();
 
   const itemsNeedAction: string[] = [];
-  if (!isNodeSetupComplete && nodeSystemInfo) {
-    itemsNeedAction.push("node-setup");
-  }
-  if (!isAnyProviderSetup() && !loading) {
+  if (!hasProviderSetup && !loading) {
     itemsNeedAction.push("ai-setup");
   }
 
-  if (itemsNeedAction.length === 0) {
+  if (itemsNeedAction.length === 0 && !forceShow) {
+    if (variant === "dialog") {
+      return null;
+    }
+
     return (
-      <h1 className="text-6xl font-bold mb-8 bg-clip-text text-transparent bg-gradient-to-r from-gray-900 to-gray-600 dark:from-gray-100 dark:to-gray-400 tracking-tight">
-        Build your dream app
+      <h1 className="text-center text-5xl font-bold mb-8 bg-clip-text text-transparent bg-gradient-to-r from-gray-900 to-gray-600 dark:from-gray-100 dark:to-gray-400 tracking-tight">
+        {t("setup.buildNewApp")}
       </h1>
     );
   }
 
-  const bannerClasses = cn(
-    "w-full mb-6 border rounded-xl shadow-sm overflow-hidden",
-    "border-zinc-200 dark:border-zinc-700",
-  );
-
-  const getStatusIcon = (isComplete: boolean, hasError: boolean = false) => {
-    if (hasError) {
-      return <XCircle className="w-5 h-5 text-red-500" />;
-    }
-    return isComplete ? (
-      <CheckCircle className="w-5 h-5 text-green-600 dark:text-green-500" />
-    ) : (
-      <AlertCircle className="w-5 h-5 text-yellow-600 dark:text-yellow-500" />
-    );
-  };
-
   return (
     <>
-      <p className="text-xl text-zinc-700 dark:text-zinc-300 p-4">
-        Follow these steps and you'll be ready to start building with Dyad...
-      </p>
-      <div className={bannerClasses}>
-        <Accordion
-          type="multiple"
-          className="w-full"
-          defaultValue={itemsNeedAction}
+      <div
+        className={cn(
+          "w-full rounded-lg bg-background px-5 py-5",
+          variant === "inline" && "mt-6 mb-6 border border-border shadow-sm",
+        )}
+      >
+        <div className="mx-auto max-w-2xl text-center">
+          <h2 className="text-2xl font-semibold tracking-tight text-foreground">
+            {hasProviderSetup
+              ? "Manage AI setup"
+              : variant === "dialog"
+                ? "You're almost ready to build"
+                : "Connect AI to start building"}
+          </h2>
+          {variant === "dialog" && hasPendingPrompt && !hasProviderSetup ? (
+            <p className="mt-2 flex items-center justify-center gap-1.5 text-sm leading-6 text-muted-foreground">
+              <CircleCheck
+                aria-hidden="true"
+                className="size-4 shrink-0 text-primary"
+              />
+              Your prompt is saved — it'll send as soon as you're connected.
+            </p>
+          ) : (
+            <p className="mt-2 text-sm leading-6 text-muted-foreground">
+              {hasProviderSetup
+                ? "Change how Dyad accesses AI."
+                : "Dyad uses AI to build your app."}
+            </p>
+          )}
+        </div>
+
+        <button
+          type="button"
+          onClick={handleDyadProSetupClick}
+          className="mt-5 flex w-full cursor-pointer items-center justify-between gap-4 rounded-lg border border-primary/45 bg-primary/8 p-4 text-left transition-colors hover:bg-primary/12 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 dark:bg-primary/15 dark:hover:bg-primary/20"
         >
-          <AccordionItem
-            value="node-setup"
-            className={cn(
-              nodeCheckError
-                ? "bg-red-50 dark:bg-red-900/30"
-                : isNodeSetupComplete
-                  ? "bg-green-50 dark:bg-green-900/30"
-                  : "bg-yellow-50 dark:bg-yellow-900/30",
-            )}
-          >
-            <AccordionTrigger className="px-4 py-3 transition-colors w-full hover:no-underline">
-              <div className="flex items-center justify-between w-full">
-                <div className="flex items-center gap-3">
-                  {getStatusIcon(isNodeSetupComplete, nodeCheckError)}
-                  <span className="font-medium text-sm">
-                    1. Install Node.js (App Runtime)
-                  </span>
-                </div>
-              </div>
-            </AccordionTrigger>
-            <AccordionContent className="px-4 pt-2 pb-4 bg-white dark:bg-zinc-900 border-t border-inherit">
-              {nodeCheckError && (
-                <p className="text-sm text-red-600 dark:text-red-400">
-                  Error checking Node.js status. Try installing Node.js.
-                </p>
-              )}
-              {isNodeSetupComplete ? (
-                <p className="text-sm">
-                  Node.js ({nodeSystemInfo!.nodeVersion}) installed.{" "}
-                  {nodeSystemInfo!.pnpmVersion && (
-                    <span className="text-xs text-gray-500">
-                      {" "}
-                      (optional) pnpm ({nodeSystemInfo!.pnpmVersion}) installed.
-                    </span>
-                  )}
-                </p>
-              ) : (
-                <div className="text-sm">
-                  <p>Node.js is required to run apps locally.</p>
-                  {nodeInstallStep === "waiting-for-continue" && (
-                    <p className="mt-1">
-                      After you have installed Node.js, click "Continue". If the
-                      installer didn't work, try{" "}
-                      <a
-                        className="text-blue-500 dark:text-blue-400 hover:underline"
-                        onClick={() => {
-                          IpcClient.getInstance().openExternalUrl(
-                            "https://nodejs.org/en/download",
-                          );
-                        }}
-                      >
-                        more download options
-                      </a>
-                      .
-                    </p>
-                  )}
-                  <NodeInstallButton
-                    nodeInstallStep={nodeInstallStep}
-                    handleNodeInstallClick={handleNodeInstallClick}
-                    finishNodeInstall={finishNodeInstall}
-                  />
-                </div>
-              )}
-              <NodeJsHelpCallout />
-            </AccordionContent>
-          </AccordionItem>
-
-          <AccordionItem
-            value="ai-setup"
-            className={cn(
-              isAnyProviderSetup()
-                ? "bg-green-50 dark:bg-green-900/30"
-                : "bg-yellow-50 dark:bg-yellow-900/30",
-            )}
-          >
-            <AccordionTrigger
-              className={cn(
-                "px-4 py-3 transition-colors w-full hover:no-underline",
-              )}
-            >
-              <div className="flex items-center justify-between w-full">
-                <div className="flex items-center gap-3">
-                  {getStatusIcon(isAnyProviderSetup())}
-                  <span className="font-medium text-sm">
-                    2. Setup AI Model Access
-                  </span>
-                </div>
-              </div>
-            </AccordionTrigger>
-            <AccordionContent className="px-4 pt-2 pb-4 bg-white dark:bg-zinc-900 border-t border-inherit">
-              <p className="text-sm mb-3">
-                Connect your preferred AI provider to start generating code.
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="flex size-11 shrink-0 items-center justify-center rounded-full bg-primary/10">
+              <img src={logo} alt="Dyad Logo" className="size-6" />
+            </div>
+            <div className="min-w-0">
+              <h3 className="text-lg font-semibold text-primary">
+                Start free Dyad Pro trial
+              </h3>
+              <p className="mt-0.5 text-sm text-muted-foreground">
+                No API keys. Access leading models instantly.
               </p>
-              <div
-                className="p-3 bg-blue-50 dark:bg-blue-900/50 border border-blue-200 dark:border-blue-700 rounded-lg cursor-pointer hover:bg-blue-100 dark:hover:bg-blue-900/70 transition-colors"
-                onClick={handleAiSetupClick}
-                role="button"
-                tabIndex={isNodeSetupComplete ? 0 : -1}
-              >
-                <div className="flex items-center justify-between gap-3">
-                  <div className="flex items-center gap-2">
-                    <div className="bg-blue-100 dark:bg-blue-800 p-1.5 rounded-full">
-                      <Sparkles className="w-4 h-4 text-blue-600 dark:text-blue-400" />
-                    </div>
-                    <div>
-                      <h4 className="font-medium text-sm text-blue-800 dark:text-blue-300">
-                        Setup Google Gemini API Key
-                      </h4>
-                      <p className="text-xs text-blue-600 dark:text-blue-400 flex items-center gap-1">
-                        <GiftIcon className="w-3 h-3" />
-                        Use Google Gemini for free
-                      </p>
-                    </div>
-                  </div>
-                  <ChevronRight className="w-4 h-4 text-blue-600 dark:text-blue-400" />
-                </div>
-              </div>
+            </div>
+          </div>
+          <Button as="span" size="sm" className="shrink-0">
+            Start
+          </Button>
+        </button>
 
-              <div
-                className="mt-2 p-3 bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-lg cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-800/70 transition-colors"
-                onClick={handleOtherProvidersClick}
-                role="button"
-                tabIndex={isNodeSetupComplete ? 0 : -1}
+        <div className="mt-4">
+          <p className="mb-2 text-sm font-medium text-muted-foreground">
+            Or use your own subscription or API key
+          </p>
+          <button
+            type="button"
+            onClick={handleSubscriptionSetupClick}
+            disabled={
+              connection.isPending ||
+              subscription.data?.pending ||
+              !settings ||
+              subscription.isLoading
+            }
+            className="flex w-full cursor-pointer items-center justify-between gap-3 rounded-md border border-border bg-(--background-lighter) px-3 py-2.5 text-left transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/35 disabled:cursor-default disabled:opacity-50"
+          >
+            <span className="flex min-w-0 items-center gap-2.5">
+              <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-background">
+                <ProviderIcon providerId="openai" className="size-4" />
+              </span>
+              <span className="min-w-0">
+                <span className="block text-sm font-semibold text-foreground">
+                  ChatGPT subscription
+                </span>
+                <span className="mt-0.5 block text-xs text-muted-foreground">
+                  Sign in with your ChatGPT account. No API key needed.
+                </span>
+              </span>
+            </span>
+            {settings &&
+            !hasPro &&
+            subscription.data &&
+            !subscription.data.pending ? (
+              <span className="shrink-0 rounded-full border border-emerald-600/25 bg-emerald-500/10 px-1.5 py-px text-[11px] font-semibold text-emerald-700 dark:border-emerald-400/25 dark:text-emerald-300">
+                Free
+              </span>
+            ) : (
+              <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
+            )}
+          </button>
+          <div className="mt-2 grid gap-2 sm:grid-cols-2">
+            <ProviderOptionButton
+              label="OpenRouter"
+              chip="Free"
+              onClick={handleOpenRouterSetupClick}
+              icon={
+                <img
+                  src={openrouterLogo}
+                  alt="OpenRouter"
+                  className="size-4 dark:invert"
+                />
+              }
+            />
+            <ProviderOptionButton
+              label="Other providers"
+              onClick={handleOtherProvidersClick}
+              icon={<Settings className="size-4 text-muted-foreground" />}
+            />
+          </div>
+          {!settings && (
+            <p className="mt-2 text-xs text-muted-foreground">
+              Checking Dyad Pro status…
+            </p>
+          )}
+          {subscription.data?.pending && (
+            <div className="mt-2 flex items-center justify-center gap-2">
+              <p
+                role="status"
+                aria-live="polite"
+                className="text-xs text-muted-foreground"
               >
-                <div className="flex items-center justify-between gap-3">
-                  <div className="flex items-center gap-2">
-                    <div className="bg-gray-100 dark:bg-gray-700 p-1.5 rounded-full">
-                      <Settings className="w-4 h-4 text-gray-600 dark:text-gray-400" />
-                    </div>
-                    <div>
-                      <h4 className="font-medium text-sm text-gray-800 dark:text-gray-300">
-                        Setup other AI providers
-                      </h4>
-                      <p className="text-xs text-gray-600 dark:text-gray-400">
-                        OpenAI, Anthropic, OpenRouter and more
-                      </p>
-                    </div>
-                  </div>
-                  <ChevronRight className="w-4 h-4 text-gray-600 dark:text-gray-400" />
-                </div>
-              </div>
-            </AccordionContent>
-          </AccordionItem>
-        </Accordion>
+                Waiting for ChatGPT sign-in in your browser…
+              </p>
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={connection.isPending}
+                onClick={() => connection.mutate(true)}
+              >
+                Cancel sign-in
+              </Button>
+            </div>
+          )}
+          {(connection.error ||
+            subscription.error ||
+            subscription.data?.error ||
+            subscription.data?.setupError) && (
+            <p role="alert" className="mt-2 text-sm text-destructive">
+              {connection.error?.message ??
+                subscription.error?.message ??
+                subscription.data?.error ??
+                subscription.data?.setupError}
+            </p>
+          )}
+        </div>
+
+        <div className="mt-4 flex w-full flex-col items-center justify-around gap-2 text-xs sm:flex-row">
+          <SetupDyadProButton />
+          <button
+            type="button"
+            onClick={() => {
+              ipc.system.openExternalUrl(
+                "https://www.youtube.com/watch?v=rgdNoHLaRN4",
+              );
+            }}
+            className="inline-flex cursor-pointer items-center gap-1.5 font-medium text-muted-foreground transition-colors hover:text-primary hover:underline"
+          >
+            <span className="inline-flex h-3.5 w-4 items-center justify-center rounded-[3px] bg-red-600 text-white">
+              <Play
+                aria-hidden="true"
+                className="ml-0.5 size-2 fill-current stroke-current"
+              />
+            </span>
+            Watch the walkthrough
+          </button>
+        </div>
       </div>
     </>
   );
 }
 
-function NodeJsHelpCallout() {
+function ProviderOptionButton({
+  label,
+  icon,
+  chip,
+  onClick,
+  disabled,
+}: {
+  label: string;
+  icon: React.ReactNode;
+  chip?: string;
+  onClick: () => void;
+  disabled?: boolean;
+}) {
   return (
-    <div className="mt-3 p-3 bg-(--background-lighter) border rounded-lg text-sm">
-      <p>
-        If you run into issues, read our{" "}
-        <a
-          onClick={() => {
-            IpcClient.getInstance().openExternalUrl(
-              "https://www.dyad.sh/docs/help/nodejs",
-            );
-          }}
-          className="text-blue-600 dark:text-blue-400 hover:underline font-medium"
-        >
-          Node.js troubleshooting guide
-        </a>
-        .{" "}
-      </p>
-      <p className="mt-2">
-        Still stuck? Click the <b>Help</b> button in the bottom-left corner and
-        then <b>Report a Bug</b>.
-      </p>
-    </div>
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className="flex min-h-12 cursor-pointer items-center justify-between gap-2 rounded-md border border-border bg-(--background-lighter) px-3 py-2 text-left text-sm font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/35 disabled:cursor-default disabled:opacity-50"
+    >
+      <span className="flex min-w-0 items-center gap-2">
+        <span className="flex size-7 shrink-0 items-center justify-center rounded-full bg-background">
+          {icon}
+        </span>
+        <span>{label}</span>
+      </span>
+      {chip ? (
+        <span className="shrink-0 rounded-full border border-emerald-600/25 bg-emerald-500/10 px-1.5 py-px text-[11px] font-semibold text-emerald-700 dark:border-emerald-400/25 dark:text-emerald-300">
+          {chip}
+        </span>
+      ) : (
+        <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
+      )}
+    </button>
   );
 }
 
-function NodeInstallButton({
-  nodeInstallStep,
-  handleNodeInstallClick,
-  finishNodeInstall,
+export const OpenRouterSetupBanner = ({
+  className,
 }: {
-  nodeInstallStep: NodeInstallStep;
-  handleNodeInstallClick: () => void;
-  finishNodeInstall: () => void;
-}) {
-  switch (nodeInstallStep) {
-    case "install":
-      return (
-        <Button className="mt-3" onClick={handleNodeInstallClick}>
-          Install Node.js Runtime
-        </Button>
-      );
-    case "continue-processing":
-      return (
-        <Button className="mt-3" onClick={finishNodeInstall} disabled>
-          <div className="flex items-center gap-2">
-            <Loader2 className="h-4 w-4 animate-spin" />
-            Checking Node.js setup...
-          </div>
-        </Button>
-      );
-    case "waiting-for-continue":
-      return (
-        <Button className="mt-3" onClick={finishNodeInstall}>
-          <div className="flex items-center gap-2">
-            Continue | I installed Node.js
-          </div>
-        </Button>
-      );
-    case "finished-checking":
-      return (
-        <div className="mt-3 text-sm text-red-600 dark:text-red-400">
-          Node.js not detected. Closing and re-opening Dyad usually fixes this.
-        </div>
-      );
-    default:
-      const _exhaustiveCheck: never = nodeInstallStep;
-  }
-}
+  className?: string;
+}) => {
+  const posthog = usePostHog();
+  const navigate = useNavigate();
+  return (
+    <SetupProviderCard
+      className={cn("mt-2", className)}
+      variant="openrouter"
+      onClick={() => {
+        posthog.capture("setup-flow:ai-provider-setup:openrouter:click");
+        navigate({
+          to: providerSettingsRoute.id,
+          params: { provider: "openrouter" },
+        });
+      }}
+      tabIndex={0}
+      leadingIcon={
+        <img
+          src={openrouterLogo}
+          alt="OpenRouter"
+          className="w-4 h-4 dark:invert"
+        />
+      }
+      title="Setup OpenRouter API Key"
+      chip={
+        <>
+          <GiftIcon className="w-3 h-3" />
+          Free models available
+        </>
+      }
+    />
+  );
+};

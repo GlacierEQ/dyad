@@ -1,18 +1,26 @@
+import { initialChatExecution } from "@/ipc/utils/chat_execution_selection";
 import { dialog } from "electron";
 import fs from "fs/promises";
 import path from "path";
 import { createLoggedHandler } from "./safe_handle";
 import log from "electron-log";
-import { getDyadAppPath } from "../../paths/paths";
+import { getDyadAppPath, isAppLocationAccessible } from "../../paths/paths";
 import { apps } from "@/db/schema";
 import { db } from "@/db";
 import { chats } from "@/db/schema";
 import { eq } from "drizzle-orm";
-import git from "isomorphic-git";
 
-import { ImportAppParams, ImportAppResult } from "../ipc_types";
+import { ImportAppParams, ImportAppResult } from "@/ipc/types";
 import { copyDirectoryRecursive } from "../utils/file_utils";
-import { gitCommit } from "../utils/git_utils";
+import { gitService } from "../services/git_service";
+import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
+import { getInitialChatModeForNewChat } from "./chat_mode_resolution";
+import {
+  sanitizeAppDisplayName,
+  slugifyAppFolderName,
+} from "@/shared/app_names";
+import { resolveUniqueFolderName } from "../utils/app_name_resolution";
+import { queryInvalidationBus } from "@/window_infrastructure/main/query_invalidation_bus";
 
 const logger = log.scope("import-handlers");
 const handle = createLoggedHandler(logger);
@@ -45,20 +53,12 @@ export function registerImportHandlers() {
     }
   });
 
-  // Handler for checking if an app name is already taken
+  // Handler for checking if an app name is already taken. Only the display
+  // name can hard-conflict — folder names are derived slugs that auto-suffix
+  // past filesystem collisions.
   handle("check-app-name", async (_, { appName }: { appName: string }) => {
-    // Check filesystem
-    const appPath = getDyadAppPath(appName);
-    try {
-      await fs.access(appPath);
-      return { exists: true };
-    } catch {
-      // Path doesn't exist, continue checking database
-    }
-
-    // Check database
     const existingApp = await db.query.apps.findFirst({
-      where: eq(apps.name, appName),
+      where: eq(apps.name, sanitizeAppDisplayName(appName)),
     });
 
     return { exists: !!existingApp };
@@ -68,76 +68,97 @@ export function registerImportHandlers() {
   handle(
     "import-app",
     async (
-      _,
-      { path: sourcePath, appName }: ImportAppParams,
+      event,
+      {
+        path: sourcePath,
+        installCommand,
+        startCommand,
+        skipCopy,
+        ...params
+      }: ImportAppParams,
     ): Promise<ImportAppResult> => {
+      const appName = sanitizeAppDisplayName(params.appName);
       // Validate the source path exists
       try {
         await fs.access(sourcePath);
       } catch {
-        throw new Error("Source folder does not exist");
+        throw new DyadError(
+          "Source folder does not exist",
+          DyadErrorKind.NotFound,
+        );
       }
 
-      const destPath = getDyadAppPath(appName);
+      // The display name conflicting is a hard error (the import dialog
+      // pre-checks it); folder collisions auto-resolve with a suffix.
+      const existingApp = await db.query.apps.findFirst({
+        where: eq(apps.name, appName),
+      });
+      if (existingApp) {
+        throw new DyadError(
+          "An app with this name already exists",
+          DyadErrorKind.Conflict,
+        );
+      }
 
-      // Check if the app already exists
-      const errorMessage = "An app with this name already exists";
-      try {
-        await fs.access(destPath);
-        throw new Error(errorMessage);
-      } catch (error: any) {
-        if (error.message === errorMessage) {
-          throw error;
+      // Determine the app path based on skipCopy
+      let folderName: string | null = null;
+      if (!skipCopy) {
+        folderName = await resolveUniqueFolderName(
+          slugifyAppFolderName(appName),
+        );
+      }
+      const appPath = skipCopy ? sourcePath : getDyadAppPath(folderName!);
+
+      if (!skipCopy) {
+        if (!isAppLocationAccessible(appPath)) {
+          throw new Error(
+            `The path ${appPath} is inaccessible. Please check your custom apps folder setting.`,
+          );
         }
+
+        // Copy the app folder to the Dyad apps directory.
+        // Why not use fs.cp? Because we want stable ordering for
+        // tests.
+        await copyDirectoryRecursive(sourcePath, appPath);
       }
-      // Copy the app folder to the Dyad apps directory.
-      // Why not use fs.cp? Because we want stable ordering for
-      // tests.
-      await copyDirectoryRecursive(sourcePath, destPath);
 
       const isGitRepo = await fs
-        .access(path.join(destPath, ".git"))
+        .access(path.join(appPath, ".git"))
         .then(() => true)
         .catch(() => false);
       if (!isGitRepo) {
         // Initialize git repo and create first commit
-        await git.init({
-          fs: fs,
-          dir: destPath,
-          defaultBranch: "main",
-        });
-
-        // Stage all files
-        await git.add({
-          fs: fs,
-          dir: destPath,
-          filepath: ".",
-        });
-
-        // Create initial commit
-        await gitCommit({
-          path: destPath,
-          message: "Init Dyad app",
-        });
+        await gitService.initRepoWithInitialCommit({ path: appPath });
       }
 
       // Create a new app
+      // Store the full absolute path when skipCopy is true, otherwise store
+      // the derived folder name.
+      // Imported apps don't need an app blueprint — the schema default (false) is correct.
       const [app] = await db
         .insert(apps)
         .values({
           name: appName,
-          // Use the name as the path for now
-          path: appName,
+          path: skipCopy ? sourcePath : folderName!,
+          installCommand: installCommand ?? null,
+          startCommand: startCommand ?? null,
         })
         .returning();
+
+      const initialChatMode = await getInitialChatModeForNewChat();
 
       // Create an initial chat for this app
       const [chat] = await db
         .insert(chats)
         .values({
           appId: app.id,
+          chatMode: initialChatMode,
+          ...(await initialChatExecution()),
         })
         .returning();
+      queryInvalidationBus.publish([{ family: "apps" }, { family: "chats" }], {
+        originEndpoint: event.sender,
+      });
       return { appId: app.id, chatId: chat.id };
     },
   );

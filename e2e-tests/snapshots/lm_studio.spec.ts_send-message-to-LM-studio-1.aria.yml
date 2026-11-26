@@ -1,8 +1,8 @@
+- button "Restore to this point"
 - paragraph: hi
-- img
-- text: file1.txt
-- img
-- text: file1.txt
+- button "file1.txt file1.txt Edit"
 - paragraph: More EOM
-- button "Retry":
-  - img
+- button "Copy"
+- text: lmstudio-model-1
+- button "Undo"
+- button "Retry"

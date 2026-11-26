@@ -1,14 +1,20 @@
 import {
-  ArrowLeft,
+  ArrowUp,
   Circle,
   ExternalLink,
   GiftIcon,
   KeyRound,
-  Settings as SettingsIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { BackButton } from "@/components/ui/back-button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { IpcClient } from "@/ipc/ipc_client";
+import { ipc } from "@/ipc/types";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import {} from "react";
 
 interface ProviderSettingsHeaderProps {
   providerDisplayName: string;
@@ -17,7 +23,7 @@ interface ProviderSettingsHeaderProps {
   hasFreeTier?: boolean;
   providerWebsiteUrl?: string;
   isDyad: boolean;
-  onBackClick: () => void;
+  onOpenProviderWebsite?: () => void;
 }
 
 function getKeyButtonText({
@@ -42,26 +48,30 @@ export function ProviderSettingsHeader({
   hasFreeTier,
   providerWebsiteUrl,
   isDyad,
-  onBackClick,
+  onOpenProviderWebsite,
 }: ProviderSettingsHeaderProps) {
   const handleGetApiKeyClick = (e: React.MouseEvent<HTMLButtonElement>) => {
     e.preventDefault();
     if (providerWebsiteUrl) {
-      IpcClient.getInstance().openExternalUrl(providerWebsiteUrl);
+      ipc.system.openExternalUrl(providerWebsiteUrl);
+      onOpenProviderWebsite?.();
     }
   };
 
+  const ConfigureButton = (
+    <Button
+      onClick={handleGetApiKeyClick}
+      className="mb-4 cursor-pointer py-5 w-full ring-4 ring-primary/60 shadow-lg shadow-primary/30 border-primary/60"
+    >
+      <KeyRound className="mr-2 h-4 w-4" />
+      {getKeyButtonText({ isConfigured, isDyad })}
+      <ExternalLink className="ml-2 h-4 w-4" />
+    </Button>
+  );
+
   return (
     <>
-      <Button
-        onClick={onBackClick}
-        variant="outline"
-        size="sm"
-        className="flex items-center gap-2 mb-4 bg-(--background-lightest) py-5"
-      >
-        <ArrowLeft className="h-4 w-4" />
-        Go Back
-      </Button>
+      <BackButton />
 
       <div className="mb-6">
         <div className="flex items-center mb-1">
@@ -88,28 +98,37 @@ export function ProviderSettingsHeader({
           </span>
         </div>
         {!isLoading && hasFreeTier && (
-          <span className="text-blue-600 mt-2 dark:text-blue-400 text-sm font-medium bg-blue-100 dark:bg-blue-900/30 px-2 py-1 rounded-full inline-flex items-center">
-            <GiftIcon className="w-4 h-4 mr-1" />
-            Free tier available
-          </span>
+          <>
+            <span className="text-blue-600 mt-2 dark:text-blue-400 text-sm font-medium bg-blue-100 dark:bg-blue-900/30 px-2 py-1 rounded-full inline-flex items-center">
+              <GiftIcon className="w-4 h-4 mr-1" />
+              Free tier available
+            </span>
+            <p className="mt-2 text-sm text-gray-600 dark:text-gray-400">
+              Free tiers typically allow the provider to use your data to train
+              AI models.
+            </p>
+          </>
         )}
       </div>
 
-      {providerWebsiteUrl && !isLoading && (
-        <Button
-          onClick={handleGetApiKeyClick}
-          className="mb-4 bg-(--background-lightest) cursor-pointer py-5"
-          variant="outline"
-        >
-          {isConfigured ? (
-            <SettingsIcon className="mr-2 h-4 w-4" />
-          ) : (
-            <KeyRound className="mr-2 h-4 w-4" />
-          )}
-          {getKeyButtonText({ isConfigured, isDyad })}
-          <ExternalLink className="ml-2 h-4 w-4" />
-        </Button>
-      )}
+      {providerWebsiteUrl &&
+        !isLoading &&
+        (!isConfigured ? (
+          <Popover defaultOpen>
+            <PopoverTrigger render={ConfigureButton} />
+            <PopoverContent
+              side="bottom"
+              align="center"
+              className="w-fit py-2 px-3 bg-background text-primary shadow-lg ring-1 ring-primary/40"
+            >
+              <div className="text-sm font-semibold flex items-center gap-1">
+                <ArrowUp /> Create your API key with {providerDisplayName}
+              </div>
+            </PopoverContent>
+          </Popover>
+        ) : (
+          ConfigureButton
+        ))}
     </>
   );
 }

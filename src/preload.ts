@@ -1,143 +1,79 @@
 // See the Electron documentation for details on how to use preload scripts:
 // https://www.electronjs.org/docs/latest/tutorial/process-model#preload-scripts
 
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, webFrame } from "electron";
+import {
+  VALID_INVOKE_CHANNELS,
+  VALID_RECEIVE_CHANNELS,
+  VALID_SEND_CHANNELS,
+  type ValidInvokeChannel,
+  type ValidReceiveChannel,
+  type ValidSendChannel,
+} from "./ipc/preload/channels";
+import { isIpcInvokeEnvelope, unwrapIpcEnvelope } from "./ipc/contracts/core";
+import { systemSendContracts } from "./ipc/types/system";
 
-// Whitelist of valid channels
-const validInvokeChannels = [
-  "get-language-models",
-  "get-language-models-by-providers",
-  "create-custom-language-model",
-  "get-language-model-providers",
-  "delete-custom-language-model-provider",
-  "create-custom-language-model-provider",
-  "delete-custom-language-model",
-  "delete-custom-model",
-  "chat:add-dep",
-  "chat:message",
-  "chat:cancel",
-  "chat:stream",
-  "chat:count-tokens",
-  "create-chat",
-  "create-app",
-  "copy-app",
-  "get-chat",
-  "get-chats",
-  "get-chat-logs",
-  "list-apps",
-  "get-app",
-  "get-app-env-vars",
-  "set-app-env-vars",
-  "edit-app-file",
-  "read-app-file",
-  "run-app",
-  "stop-app",
-  "restart-app",
-  "list-versions",
-  "revert-version",
-  "checkout-version",
-  "get-current-branch",
-  "delete-app",
-  "rename-app",
-  "get-user-settings",
-  "set-user-settings",
-  "get-env-vars",
-  "open-external-url",
-  "show-item-in-folder",
-  "reset-all",
-  "nodejs-status",
-  "install-node",
-  "github:start-flow",
-  "github:list-repos",
-  "github:get-repo-branches",
-  "github:is-repo-available",
-  "github:create-repo",
-  "github:connect-existing-repo",
-  "github:push",
-  "github:disconnect",
-  "vercel:save-token",
-  "vercel:list-projects",
-  "vercel:is-project-available",
-  "vercel:create-project",
-  "vercel:connect-existing-project",
-  "vercel:get-deployments",
-  "vercel:disconnect",
-  "get-app-version",
-  "reload-env-path",
-  "get-proposal",
-  "approve-proposal",
-  "reject-proposal",
-  "get-system-debug-info",
-  "supabase:list-projects",
-  "supabase:set-app-project",
-  "supabase:unset-app-project",
-  "local-models:list-ollama",
-  "local-models:list-lmstudio",
-  "window:minimize",
-  "window:maximize",
-  "window:close",
-  "get-system-platform",
-  "upload-to-signed-url",
-  "delete-chat",
-  "update-chat",
-  "delete-messages",
-  "start-chat-stream",
-  "does-release-note-exist",
-  "import-app",
-  "check-ai-rules",
-  "select-app-folder",
-  "check-app-name",
-  "rename-branch",
-  "clear-session-data",
-  "get-user-budget",
-  "get-context-paths",
-  "set-context-paths",
-  "get-app-upgrades",
-  "execute-app-upgrade",
-  "is-capacitor",
-  "sync-capacitor",
-  "open-ios",
-  "open-android",
-  "check-problems",
-  "restart-dyad",
-  "get-templates",
-  // Test-only channels
-  // These should ALWAYS be guarded with IS_TEST_BUILD in the main process.
-  // We can't detect with IS_TEST_BUILD in the preload script because
-  // it's a separate process from the main process.
-  "supabase:fake-connect-and-set-project",
-];
+// Use the contract-derived channel arrays
+const validInvokeChannels = VALID_INVOKE_CHANNELS;
+const validReceiveChannels = VALID_RECEIVE_CHANNELS;
 
-// Add valid receive channels
-const validReceiveChannels = [
-  "chat:response:chunk",
-  "chat:response:end",
-  "chat:response:error",
-  "app:output",
-  "github:flow-update",
-  "github:flow-success",
-  "github:flow-error",
-  "deep-link-received",
-] as const;
+function isValidReceiveChannel(
+  channel: string,
+): channel is ValidReceiveChannel {
+  return validReceiveChannels.includes(channel as ValidReceiveChannel);
+}
 
-type ValidInvokeChannel = (typeof validInvokeChannels)[number];
-type ValidReceiveChannel = (typeof validReceiveChannels)[number];
+function isValidDynamicReceiveChannel(channel: string): boolean {
+  // Terminal stream suffixes must stay server-generated, unpredictable session
+  // IDs. Do not extend this pattern to renderer-controlled channel names.
+  return (
+    channel.startsWith("terminal:data:") || channel.startsWith("terminal:exit:")
+  );
+}
 
 // Expose protected methods that allow the renderer process to use
 // the ipcRenderer without exposing the entire object
 contextBridge.exposeInMainWorld("electron", {
   ipcRenderer: {
-    invoke: (channel: ValidInvokeChannel, ...args: unknown[]) => {
-      if (validInvokeChannels.includes(channel)) {
+    invoke: (channel: ValidInvokeChannel | string, ...args: unknown[]) => {
+      if ((validInvokeChannels as readonly string[]).includes(channel)) {
+        return ipcRenderer.invoke(channel, ...args).then((response) => {
+          if (isIpcInvokeEnvelope(response)) {
+            return unwrapIpcEnvelope(response);
+          }
+          return response;
+        });
+      }
+      throw new Error(`Invalid channel: ${channel}`);
+    },
+    invokeEnvelope: (
+      channel: ValidInvokeChannel | string,
+      ...args: unknown[]
+    ) => {
+      if ((validInvokeChannels as readonly string[]).includes(channel)) {
         return ipcRenderer.invoke(channel, ...args);
       }
       throw new Error(`Invalid channel: ${channel}`);
     },
+    // One-way, fire-and-forget renderer -> main. No response is returned, so
+    // this is safe to call while the frame is being torn down (e.g. from a
+    // `pagehide` handler on app quit), where a reply-expecting `invoke` would
+    // make the main process throw "Object has been destroyed".
+    send: (channel: ValidSendChannel | string, ...args: unknown[]) => {
+      if ((VALID_SEND_CHANNELS as readonly string[]).includes(channel)) {
+        ipcRenderer.send(channel, ...args);
+        return;
+      }
+      throw new Error(`Invalid channel: ${channel}`);
+    },
     on: (
-      channel: ValidReceiveChannel,
+      channel: ValidReceiveChannel | string,
       listener: (...args: unknown[]) => void,
     ) => {
-      if (validReceiveChannels.includes(channel)) {
+      if (
+        isValidReceiveChannel(channel) ||
+        isValidDynamicReceiveChannel(channel)
+      ) {
         const subscription = (
           _event: Electron.IpcRendererEvent,
           ...args: unknown[]
@@ -149,18 +85,58 @@ contextBridge.exposeInMainWorld("electron", {
       }
       throw new Error(`Invalid channel: ${channel}`);
     },
-    removeAllListeners: (channel: ValidReceiveChannel) => {
-      if (validReceiveChannels.includes(channel)) {
+    removeAllListeners: (channel: ValidReceiveChannel | string) => {
+      if (
+        isValidReceiveChannel(channel) ||
+        isValidDynamicReceiveChannel(channel)
+      ) {
         ipcRenderer.removeAllListeners(channel);
       }
     },
     removeListener: (
-      channel: ValidReceiveChannel,
+      channel: ValidReceiveChannel | string,
       listener: (...args: unknown[]) => void,
     ) => {
-      if (validReceiveChannels.includes(channel)) {
+      if (
+        isValidReceiveChannel(channel) ||
+        isValidDynamicReceiveChannel(channel)
+      ) {
         ipcRenderer.removeListener(channel, listener);
       }
     },
   },
+  webFrame: {
+    setZoomFactor: (factor: number) => {
+      webFrame.setZoomFactor(factor);
+    },
+    getZoomFactor: () => webFrame.getZoomFactor(),
+  },
 });
+
+// Push this renderer's V8 heap to the main-process performance heartbeat.
+// The main process cannot read another process's heap, and this is the
+// figure that says how close the UI is to Electron's ~4 GB renderer cap.
+// Lives in the preload rather than React so a wedged UI still reports as
+// long as its event loop turns. Electron's sandboxed `process` reports KB.
+const RENDERER_HEAP_REPORT_INTERVAL_MS = 30_000;
+const KB_PER_MB = 1024;
+
+function reportRendererHeap(): void {
+  try {
+    const stats = process.getHeapStatistics();
+    ipcRenderer.send(systemSendContracts.reportRendererHeap.channel, {
+      heapUsedMB: Math.round(stats.usedHeapSize / KB_PER_MB),
+      heapLimitMB: Math.round(stats.heapSizeLimit / KB_PER_MB),
+    });
+  } catch {
+    // Best effort: the heartbeat simply lacks the renderer heap.
+  }
+}
+
+// The first report waits for the document: sent from the top of the
+// preload, it arrives before the frame passes the main process's trusted
+// renderer check and is dropped.
+window.addEventListener("DOMContentLoaded", reportRendererHeap, {
+  once: true,
+});
+setInterval(reportRendererHeap, RENDERER_HEAP_REPORT_INTERVAL_MS);

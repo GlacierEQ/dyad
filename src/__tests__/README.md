@@ -1,6 +1,11 @@
 # Test Documentation
 
-This directory contains unit tests for the Dyad application.
+Prefer co-locating new unit tests next to the implementation file they cover
+instead of adding them to this directory.
+
+This directory is reserved for tests that do not currently have a runnable
+co-located home under the root Vitest include pattern (`src/**/*.{test,spec}.{ts,tsx}`)
+and for eval assets under `evals/`.
 
 ## Testing Setup
 
@@ -38,20 +43,6 @@ vi.mock("node:fs", async () => {
 });
 ```
 
-### Mocking isomorphic-git
-
-When mocking isomorphic-git, provide a default export:
-
-```typescript
-vi.mock("isomorphic-git", () => ({
-  default: {
-    add: vi.fn().mockResolvedValue(undefined),
-    commit: vi.fn().mockResolvedValue(undefined),
-    // Add other git methods as needed
-  },
-}));
-```
-
 ### Testing IPC Handlers
 
 When testing IPC handlers, mock the Electron IPC system:
@@ -67,7 +58,7 @@ vi.mock("electron", () => ({
 
 ## Adding New Tests
 
-1. Create a new file with the `.test.ts` or `.spec.ts` extension
+1. Create a new file with the `.test.ts` or `.spec.ts` extension next to the implementation when possible
 2. Import the functions you want to test
 3. Mock any dependencies using `vi.mock()`
 4. Write your test cases using `describe()` and `it()`

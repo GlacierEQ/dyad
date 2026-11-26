@@ -1,41 +1,81 @@
 import { useQuery } from "@tanstack/react-query";
-import { IpcClient } from "@/ipc/ipc_client";
-import type { LanguageModelProvider } from "@/ipc/ipc_types";
+import { ipc, type LanguageModelProvider } from "@/ipc/types";
 import { useSettings } from "./useSettings";
-import { cloudProviders } from "@/lib/schemas";
+import { cloudProviders, isDyadProEnabled } from "@/lib/schemas";
+import { queryKeys } from "@/lib/queryKeys";
+import { isProviderSetup as isProviderSetupUtil } from "@/lib/providerUtils";
+import { useSubscriptionAccount } from "./useSubscriptionAccount";
+import {
+  isChatGPTAutoSelection,
+  usesChatGPTSubscription,
+} from "@/lib/subscriptionModels";
+
+const localProviders = new Set(["ollama", "lmstudio"]);
 
 export function useLanguageModelProviders() {
-  const ipcClient = IpcClient.getInstance();
   const { settings, envVars } = useSettings();
+  const subscription = useSubscriptionAccount();
 
   const queryResult = useQuery<LanguageModelProvider[], Error>({
-    queryKey: ["languageModelProviders"],
+    queryKey: queryKeys.languageModels.providers,
     queryFn: async () => {
-      return ipcClient.getLanguageModelProviders();
+      return ipc.languageModel.getProviders();
     },
+    networkMode: "always",
   });
 
   const isProviderSetup = (provider: string) => {
-    const providerSettings = settings?.providerSettings[provider];
-    if (queryResult.isLoading) {
-      return false;
-    }
-    if (providerSettings?.apiKey?.value) {
-      return true;
-    }
-    const providerData = queryResult.data?.find((p) => p.id === provider);
-    if (providerData?.envVarName && envVars[providerData.envVarName]) {
-      return true;
-    }
-    return false;
+    return isProviderSetupUtil(provider, {
+      settings,
+      envVars,
+      providerData: queryResult.data,
+      isLoading: queryResult.isLoading,
+    });
   };
 
   const isAnyProviderSetup = () => {
-    return cloudProviders.some((provider) => isProviderSetup(provider));
+    if (
+      settings &&
+      !subscription.data?.pending &&
+      !subscription.data?.setupError &&
+      (usesChatGPTSubscription(
+        settings.selectedModel,
+        settings,
+        subscription.data ?? { connected: false, models: [] },
+      ) ||
+        (!isDyadProEnabled(settings) &&
+          settings.proModelUsage !== "pro" &&
+          settings.proModelUsage !== "api-key" &&
+          isChatGPTAutoSelection(settings.selectedModel) &&
+          subscription.data?.connected &&
+          subscription.data.models.length > 0))
+    )
+      return true;
+    if (
+      settings?.selectedModel.provider &&
+      localProviders.has(settings.selectedModel.provider) &&
+      settings.selectedModel.name.trim()
+    ) {
+      return true;
+    }
+
+    // Check hardcoded cloud providers
+    if (cloudProviders.some((provider) => isProviderSetup(provider))) {
+      return true;
+    }
+
+    // Check custom providers
+    const customProviders = queryResult.data?.filter(
+      (provider) => provider.type === "custom",
+    );
+    return (
+      customProviders?.some((provider) => isProviderSetup(provider.id)) ?? false
+    );
   };
 
   return {
     ...queryResult,
+    isLoading: queryResult.isLoading || subscription.isLoading,
     isProviderSetup,
     isAnyProviderSetup,
   };

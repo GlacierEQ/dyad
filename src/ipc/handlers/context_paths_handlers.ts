@@ -13,6 +13,7 @@ import log from "electron-log";
 import { getDyadAppPath } from "@/paths/paths";
 import { extractCodebase } from "@/utils/codebase";
 import { validateChatContext } from "../utils/context_paths_utils";
+import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
 
 const logger = log.scope("context_paths_handlers");
 const handle = createLoggedHandler(logger);
@@ -28,21 +29,21 @@ export function registerContextPathsHandlers() {
       });
 
       if (!app) {
-        throw new Error("App not found");
+        throw new DyadError("App not found", DyadErrorKind.NotFound);
       }
 
       if (!app.path) {
-        throw new Error("App path not set");
+        throw new DyadError("App path not set", DyadErrorKind.Precondition);
       }
       const appPath = getDyadAppPath(app.path);
 
       const results: ContextPathResults = {
         contextPaths: [],
         smartContextAutoIncludes: [],
+        excludePaths: [],
       };
-      const { contextPaths, smartContextAutoIncludes } = validateChatContext(
-        app.chatContext,
-      );
+      const { contextPaths, smartContextAutoIncludes, excludePaths } =
+        validateChatContext(app.chatContext);
       for (const contextPath of contextPaths) {
         const { formattedOutput, files } = await extractCodebase({
           appPath,
@@ -72,6 +73,23 @@ export function registerContextPathsHandlers() {
 
         results.smartContextAutoIncludes.push({
           ...contextPath,
+          files: files.length,
+          tokens: totalTokens,
+        });
+      }
+
+      for (const excludePath of excludePaths || []) {
+        const { formattedOutput, files } = await extractCodebase({
+          appPath,
+          chatContext: {
+            contextPaths: [excludePath],
+            smartContextAutoIncludes: [],
+          },
+        });
+        const totalTokens = estimateTokens(formattedOutput);
+
+        results.excludePaths.push({
+          ...excludePath,
           files: files.length,
           tokens: totalTokens,
         });

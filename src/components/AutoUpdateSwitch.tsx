@@ -2,10 +2,12 @@ import { useSettings } from "@/hooks/useSettings";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { toast } from "sonner";
-import { IpcClient } from "@/ipc/ipc_client";
+import { ipc } from "@/ipc/types";
+import { useTranslation } from "react-i18next";
 
 export function AutoUpdateSwitch() {
   const { settings, updateSettings } = useSettings();
+  const { t } = useTranslation("settings");
 
   if (!settings) {
     return null;
@@ -15,6 +17,7 @@ export function AutoUpdateSwitch() {
     <div className="flex items-center space-x-2">
       <Switch
         id="enable-auto-update"
+        aria-label="Auto-update"
         checked={settings.enableAutoUpdate}
         onCheckedChange={(checked) => {
           updateSettings({ enableAutoUpdate: checked });
@@ -24,13 +27,13 @@ export function AutoUpdateSwitch() {
             action: {
               label: "Restart Dyad",
               onClick: () => {
-                IpcClient.getInstance().restartDyad();
+                ipc.system.restartDyad();
               },
             },
           });
         }}
       />
-      <Label htmlFor="enable-auto-update">Auto-update</Label>
+      <Label htmlFor="enable-auto-update">{t("general.autoUpdate")}</Label>
     </div>
   );
 }

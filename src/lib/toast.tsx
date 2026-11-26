@@ -2,6 +2,9 @@ import { toast } from "sonner";
 import { PostHog } from "posthog-js";
 import React from "react";
 import { CustomErrorToast } from "../components/CustomErrorToast";
+import { InputRequestToast } from "../components/InputRequestToast";
+
+const toastGenerations = new Map<string | number, number>();
 
 /**
  * Toast utility functions for consistent notifications across the app
@@ -19,9 +22,27 @@ export const showSuccess = (message: string) => {
  * Show an error toast
  * @param message The error message to display
  */
-export const showError = (message: any) => {
+export const showError = (
+  message: any,
+  options?: {
+    persist?: boolean;
+    toastId?: string | number;
+    action?: {
+      label: string;
+      onClick: () => void;
+    };
+  },
+) => {
   const errorMessage = message.toString();
   console.error(message);
+  const explicitToastId = options?.toastId;
+  const generation =
+    explicitToastId === undefined
+      ? undefined
+      : (toastGenerations.get(explicitToastId) ?? 0) + 1;
+  if (explicitToastId !== undefined && generation !== undefined) {
+    toastGenerations.set(explicitToastId, generation);
+  }
 
   const onCopy = (toastId: string | number) => {
     navigator.clipboard.writeText(errorMessage);
@@ -34,6 +55,7 @@ export const showError = (message: any) => {
           toastId={t}
           copied={true}
           onCopy={() => onCopy(t)}
+          action={options?.action}
         />
       ),
       { id: toastId, duration: Infinity },
@@ -41,6 +63,12 @@ export const showError = (message: any) => {
 
     // After 2 seconds, revert the toast back to the original state
     setTimeout(() => {
+      if (
+        explicitToastId !== undefined &&
+        toastGenerations.get(explicitToastId) !== generation
+      ) {
+        return;
+      }
       toast.custom(
         (t) => (
           <CustomErrorToast
@@ -48,6 +76,7 @@ export const showError = (message: any) => {
             toastId={t}
             copied={false}
             onCopy={() => onCopy(t)}
+            action={options?.action}
           />
         ),
         { id: toastId, duration: Infinity },
@@ -62,12 +91,21 @@ export const showError = (message: any) => {
         message={errorMessage}
         toastId={t}
         onCopy={() => onCopy(t)}
+        action={options?.action}
       />
     ),
-    { duration: 8_000 },
+    {
+      duration: options?.action || options?.persist ? Infinity : 8_000,
+      ...(options?.toastId === undefined ? {} : { id: options.toastId }),
+    },
   );
 
   return toastId;
+};
+
+export const dismissToast = (toastId: string | number) => {
+  toastGenerations.set(toastId, (toastGenerations.get(toastId) ?? 0) + 1);
+  toast.dismiss(toastId);
 };
 
 /**
@@ -85,6 +123,29 @@ export const showWarning = (message: string) => {
  */
 export const showInfo = (message: string) => {
   toast.info(message);
+};
+
+/**
+ * Show an input request toast for interactive prompts (y/n)
+ * @param message The prompt message to display
+ * @param onResponse Callback function called when user responds
+ */
+export const showInputRequest = (
+  message: string,
+  onResponse: (response: "y" | "n") => void,
+) => {
+  const toastId = toast.custom(
+    (t) => (
+      <InputRequestToast
+        message={message}
+        toastId={t}
+        onResponse={onResponse}
+      />
+    ),
+    { duration: Infinity }, // Don't auto-close
+  );
+
+  return toastId;
 };
 
 export const showExtraFilesToast = ({

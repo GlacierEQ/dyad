@@ -1,13 +1,18 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { Button } from "@/components/ui/button";
+import { SegmentedChoice } from "@/components/SegmentedChoice";
 import {
   Github,
   Clipboard,
   Check,
+  CircleCheck,
   AlertTriangle,
   ChevronRight,
+  FileCode2,
+  GitMerge,
+  LoaderCircle,
 } from "lucide-react";
-import { IpcClient } from "@/ipc/ipc_client";
+import { ipc } from "@/ipc/types";
 import { useSettings } from "@/hooks/useSettings";
 import { useLoadApp } from "@/hooks/useLoadApp";
 import {
@@ -27,6 +32,26 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { CopyErrorMessage } from "@/components/CopyErrorMessage";
+import { GithubBranchManager } from "@/components/GithubBranchManager";
+import { useResolveMergeConflictsWithAI } from "@/hooks/useResolveMergeConflictsWithAI";
+import { useChatStreamState } from "@/hooks/useChatStream";
+import { slugifyAppPath } from "@/shared/slugify";
+import {
+  isAppliedGithubOpsReceipt,
+  useGithubOps,
+} from "@/github_ops/useGithubOps";
+import { isDetailedGithubOpsErrorMessage } from "@/github_ops/error_message";
+import type { GitRemoteProviderName } from "@/github_ops/state";
+import {
+  acknowledgeConnectionFlow,
+  cancelConnectionFlow,
+  startConnectionFlow,
+  useConnectionFlow,
+  useUnsolicitedConnectionReturn,
+} from "@/hooks/useConnectionFlow";
+import { describeLinkedRemote } from "@/shared/linked_remote";
+import { showError } from "@/lib/toast";
 
 interface GitHubConnectorProps {
   appId: number | null;
@@ -45,120 +70,246 @@ interface GitHubBranch {
   commit: { sha: string };
 }
 
+interface LinkedGitHubRepo {
+  org: string;
+  repo: string;
+}
+
+function GitHubTroubleshootingLink({ className = "" }: { className?: string }) {
+  return (
+    <a
+      href="https://www.dyad.sh/docs/integrations/github#troubleshooting"
+      onClick={(event) => {
+        event.preventDefault();
+        ipc.system.openExternalUrl(
+          "https://www.dyad.sh/docs/integrations/github#troubleshooting",
+        );
+      }}
+      className={`cursor-pointer text-blue-600 hover:underline dark:text-blue-400 ${className}`}
+      target="_blank"
+      rel="noopener noreferrer"
+    >
+      See troubleshooting guide
+    </a>
+  );
+}
+
+export function GitHubOperationError({
+  message,
+  providerLabel = "GitHub",
+}: {
+  message: string;
+  /** Names the provider in the heading; the troubleshooting guide is GitHub's. */
+  providerLabel?: string;
+}) {
+  const showDetails = isDetailedGithubOpsErrorMessage(message);
+  const showGuide = providerLabel === "GitHub";
+
+  if (!showDetails) {
+    return (
+      <p className="text-red-600">
+        {message} {showGuide && <GitHubTroubleshootingLink />}
+      </p>
+    );
+  }
+
+  return (
+    <div className="rounded-md border border-red-200 bg-red-50/70 p-3 dark:border-red-900 dark:bg-red-950/40">
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <p className="text-sm font-medium text-red-800 dark:text-red-200">
+          {providerLabel} operation failed
+        </p>
+        <CopyErrorMessage errorMessage={message} />
+      </div>
+      <div
+        role="region"
+        aria-label={`${providerLabel} error details`}
+        tabIndex={0}
+        className="scrollbar-on-hover max-h-[min(50vh,20rem)] overflow-x-hidden overflow-y-auto overscroll-contain rounded border border-red-200/70 bg-white/60 p-2 font-mono text-xs whitespace-pre-wrap text-red-900 [overflow-wrap:anywhere] focus-visible:ring-2 focus-visible:ring-red-500 focus-visible:outline-none dark:border-red-900 dark:bg-black/20 dark:text-red-100"
+      >
+        {message}
+      </div>
+      {showGuide && (
+        <GitHubTroubleshootingLink className="mt-2 inline-block text-sm" />
+      )}
+    </div>
+  );
+}
+
 interface ConnectedGitHubConnectorProps {
   appId: number;
   app: any;
-  refreshApp: () => void;
-  triggerAutoSync?: boolean;
-  onAutoSyncComplete?: () => void;
 }
 
-interface UnconnectedGitHubConnectorProps {
+export interface UnconnectedGitHubConnectorProps {
   appId: number | null;
   folderName: string;
   settings: any;
   refreshSettings: () => void;
-  handleRepoSetupComplete: () => void;
   expanded?: boolean;
+  linkedRepo?: LinkedGitHubRepo;
 }
 
-function ConnectedGitHubConnector({
+/**
+ * The sync controls for an app linked to a repository. The operations
+ * behind them are plain git, so the same view serves GitHub and GitLab; only
+ * the provider's name and the repository link differ.
+ */
+export function ConnectedGitHubConnector({
   appId,
   app,
-  refreshApp,
-  triggerAutoSync,
-  onAutoSyncComplete,
 }: ConnectedGitHubConnectorProps) {
-  const [isSyncing, setIsSyncing] = useState(false);
-  const [syncError, setSyncError] = useState<string | null>(null);
-  const [syncSuccess, setSyncSuccess] = useState<boolean>(false);
   const [showForceDialog, setShowForceDialog] = useState(false);
-  const [isDisconnecting, setIsDisconnecting] = useState(false);
-  const [disconnectError, setDisconnectError] = useState<string | null>(null);
-  const autoSyncTriggeredRef = useRef(false);
-
-  const handleDisconnectRepo = async () => {
-    setIsDisconnecting(true);
-    setDisconnectError(null);
-    try {
-      await IpcClient.getInstance().disconnectGithubRepo(appId);
-      refreshApp();
-    } catch (err: any) {
-      setDisconnectError(err.message || "Failed to disconnect repository.");
-    } finally {
-      setIsDisconnecting(false);
-    }
-  };
-
-  const handleSyncToGithub = useCallback(
-    async (force: boolean = false) => {
-      setIsSyncing(true);
-      setSyncError(null);
-      setSyncSuccess(false);
-      setShowForceDialog(false);
-
-      try {
-        const result = await IpcClient.getInstance().syncGithubRepo(
-          appId,
-          force,
-        );
-        if (result.success) {
-          setSyncSuccess(true);
-        } else {
-          setSyncError(result.error || "Failed to sync to GitHub.");
-          // If it's a push rejection error, show the force dialog
-          if (
-            result.error?.includes("rejected") ||
-            result.error?.includes("non-fast-forward")
-          ) {
-            // Don't show force dialog immediately, let user see the error first
-          }
-        }
-      } catch (err: any) {
-        setSyncError(err.message || "Failed to sync to GitHub.");
-      } finally {
-        setIsSyncing(false);
-      }
+  const linked = describeLinkedRemote(app);
+  const providerLabel = linked?.providerLabel ?? "GitHub";
+  const providerShortLabel =
+    linked?.provider === "gitlab" ? "GitLab" : "GitHub";
+  // Every operation names its provider. An app with no link yet can only be
+  // reached through the GitHub path, which is what this component is.
+  const opProvider: GitRemoteProviderName =
+    linked?.provider === "gitlab" ? "gitlab" : "github";
+  const {
+    projection,
+    connection,
+    send,
+    dispatchWithErrorFeedback,
+    dispatchConflictResolutionStarted,
+    dispatchConflictResolutionCancelled,
+    conflictResolutionClaimed,
+  } = useGithubOps(appId, { autoDismissPushSuccessBanner: true });
+  const {
+    banner,
+    state: githubOpsState,
+    capabilities: {
+      canAbortRebase,
+      canCancelSync,
+      canContinueSync,
+      canRetryConflictVerification,
+      canContinueRebase,
+      canDisconnect,
+      canForcePush,
+      canRebaseAndSync,
+      canResolveConflicts,
+      canSafeForcePush,
+      canSync,
     },
-    [appId],
+    isOperationInFlight,
+    isSyncing,
+    conflicts,
+    conflictRecoveryStage,
+    conflictResolutionChatId,
+    conflictVerificationError,
+    syncContinuationOperation,
+    rebaseAction,
+    showForcePush,
+    showRebaseAndSync,
+    showRebaseRecoveryOptions,
+    abortOperation,
+    isCancellingSync,
+    runningOperation,
+  } = projection;
+
+  const { resolveFilesWithAI, isResolving } = useResolveMergeConflictsWithAI({
+    appId,
+    conflicts,
+    onStartResolving: dispatchConflictResolutionStarted,
+    onStartFailed: dispatchConflictResolutionCancelled,
+  });
+
+  const conflictResolutionChat = useChatStreamState(
+    conflictResolutionChatId ?? undefined,
   );
 
-  // Auto-sync when triggerAutoSync prop is true
   useEffect(() => {
-    if (triggerAutoSync && !autoSyncTriggeredRef.current) {
-      autoSyncTriggeredRef.current = true;
-      handleSyncToGithub(false).finally(() => {
-        onAutoSyncComplete?.();
-      });
-    } else if (!triggerAutoSync) {
-      // Reset the ref when triggerAutoSync becomes false
-      autoSyncTriggeredRef.current = false;
+    if (
+      conflictRecoveryStage !== "resolving" ||
+      conflictResolutionChatId === null ||
+      !conflictResolutionChat?.lastCompletion
+    ) {
+      return;
     }
-  }, [triggerAutoSync]); // Only depend on triggerAutoSync to avoid unnecessary re-runs
+    void dispatchWithErrorFeedback({
+      type: "CONFLICT_RESOLUTION_FINISHED",
+      chatId: conflictResolutionChatId,
+    });
+  }, [
+    conflictRecoveryStage,
+    conflictResolutionChatId,
+    conflictResolutionChat?.lastCompletion,
+    dispatchWithErrorFeedback,
+  ]);
 
+  const startConflictResolution = useCallback(async () => {
+    const receipt = await dispatchWithErrorFeedback({
+      type: "RESOLVE_WITH_AI_STARTED",
+    });
+    if (isAppliedGithubOpsReceipt(receipt)) {
+      await resolveFilesWithAI(conflicts);
+    }
+  }, [conflicts, dispatchWithErrorFeedback, resolveFilesWithAI]);
+
+  const isDisconnecting = runningOperation?.type === "disconnect";
+  const isRebaseActionPending = isOperationInFlight || !!rebaseAction;
+  const isSyncConflict =
+    githubOpsState.type === "conflicted" &&
+    (githubOpsState.origin.type === "push" ||
+      githubOpsState.origin.type === "rebase" ||
+      githubOpsState.origin.type === "rebase-continue");
+  const showErrorBanner =
+    banner?.kind === "error" &&
+    (banner.code !== "MERGE_CONFLICT" || !conflictRecoveryStage);
   return (
     <div className="w-full" data-testid="github-connected-repo">
-      <p>Connected to GitHub Repo:</p>
+      {connection !== "ready" && (
+        <p className="mb-2 text-sm text-muted-foreground">
+          {connection === "connecting"
+            ? "Loading repository status…"
+            : "Repository controls are temporarily unavailable."}
+        </p>
+      )}
+      <p>Connected to {providerShortLabel} Repo:</p>
       <a
+        // The href is what makes this focusable and activatable by keyboard;
+        // the handler keeps the click in the user's browser rather than the
+        // Electron window.
+        href={linked?.webUrl}
         onClick={(e) => {
           e.preventDefault();
-          IpcClient.getInstance().openExternalUrl(
-            `https://github.com/${app.githubOrg}/${app.githubRepo}`,
-          );
+          if (!linked) return;
+          void ipc.system
+            .openExternalUrl(linked.webUrl)
+            .catch((err: unknown) =>
+              showError(
+                err instanceof Error
+                  ? err.message
+                  : "Could not open the repository.",
+              ),
+            );
         }}
         className="cursor-pointer text-blue-600 hover:underline dark:text-blue-400"
         target="_blank"
         rel="noopener noreferrer"
+        data-testid="repository-link"
       >
-        {app.githubOrg}/{app.githubRepo}
+        {linked?.displayPath}
       </a>
-      {app.githubBranch && (
-        <p className="text-sm text-gray-600 dark:text-gray-300 mt-1">
-          Branch: <span className="font-mono">{app.githubBranch}</span>
-        </p>
+      {linked?.branch && (
+        <GithubBranchManager appId={appId} provider={opProvider} />
       )}
       <div className="mt-2 flex gap-2">
-        <Button onClick={() => handleSyncToGithub(false)} disabled={isSyncing}>
+        <Button
+          onClick={() =>
+            send({
+              type: "OP_REQUESTED",
+              op: {
+                type: "push",
+                mode: "normal",
+                provider: opProvider,
+              },
+            })
+          }
+          disabled={!canSync}
+        >
           {isSyncing ? (
             <>
               <svg
@@ -185,54 +336,352 @@ function ConnectedGitHubConnector({
               Syncing...
             </>
           ) : (
-            "Sync to GitHub"
+            `Sync to ${providerShortLabel}`
           )}
         </Button>
         <Button
-          onClick={handleDisconnectRepo}
-          disabled={isDisconnecting}
+          onClick={() =>
+            send({ type: "OP_REQUESTED", op: { type: "disconnect" } })
+          }
+          disabled={!canDisconnect}
           variant="outline"
         >
           {isDisconnecting ? "Disconnecting..." : "Disconnect from repo"}
         </Button>
       </div>
-      {syncError && (
-        <div className="mt-2">
-          <p className="text-red-600">
-            {syncError}{" "}
-            <a
-              onClick={(e) => {
-                e.preventDefault();
-                IpcClient.getInstance().openExternalUrl(
-                  "https://www.dyad.sh/docs/integrations/github#troubleshooting",
-                );
-              }}
-              className="cursor-pointer text-blue-600 hover:underline dark:text-blue-400"
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              See troubleshooting guide
-            </a>
+      {showErrorBanner && (
+        <div className="mt-2 space-y-2">
+          <p role="status" aria-live="polite" className="sr-only">
+            {providerLabel} operation failed:{" "}
+            {banner.message.split("\n", 1)[0].slice(0, 240)}
           </p>
-          {(syncError.includes("rejected") ||
-            syncError.includes("non-fast-forward")) && (
+          <GitHubOperationError
+            message={banner.message}
+            providerLabel={providerLabel}
+          />
+          {showRebaseRecoveryOptions && (
+            <div className="space-y-2 rounded-md border border-orange-200 p-3 dark:border-orange-800 dark:bg-orange-900/20">
+              <p className="text-sm text-orange-800 dark:text-orange-100">
+                A rebase is already in progress. Choose how to proceed.
+              </p>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  onClick={() =>
+                    send({
+                      type: "OP_REQUESTED",
+                      op: { type: "rebase-abort" },
+                    })
+                  }
+                  variant="outline"
+                  size="sm"
+                  disabled={!canAbortRebase || isRebaseActionPending}
+                >
+                  <AlertTriangle className="h-4 w-4 mr-2" />
+                  {rebaseAction === "abort" ? "Aborting..." : "Abort rebase"}
+                </Button>
+                <Button
+                  onClick={() =>
+                    send({
+                      type: "OP_REQUESTED",
+                      op: { type: "rebase-continue", provider: opProvider },
+                    })
+                  }
+                  variant="outline"
+                  size="sm"
+                  disabled={!canContinueRebase || isRebaseActionPending}
+                >
+                  <GitMerge className="h-4 w-4 mr-2" />
+                  {rebaseAction === "continue"
+                    ? "Continuing..."
+                    : "Continue rebase"}
+                </Button>
+                <Button
+                  onClick={() =>
+                    send({
+                      type: "OP_REQUESTED",
+                      op: {
+                        type: "push",
+                        mode: "lease",
+                        provider: opProvider,
+                      },
+                    })
+                  }
+                  variant="outline"
+                  size="sm"
+                  disabled={!canSafeForcePush || isRebaseActionPending}
+                  className="text-orange-600 border-orange-600 hover:bg-orange-50"
+                >
+                  <AlertTriangle className="h-4 w-4 mr-2" />
+                  {rebaseAction === "safe-push"
+                    ? "Safe force pushing..."
+                    : "Safe Force Push"}
+                </Button>
+              </div>
+            </div>
+          )}
+          {showForcePush && (
             <Button
               onClick={() => setShowForceDialog(true)}
               variant="outline"
               size="sm"
-              className="mt-2 text-orange-600 border-orange-600 hover:bg-orange-50"
+              disabled={!canForcePush || isRebaseActionPending}
+              className="text-orange-600 border-orange-600 hover:bg-orange-50"
             >
               <AlertTriangle className="h-4 w-4 mr-2" />
               Force Push (Dangerous)
             </Button>
           )}
+          {showRebaseAndSync && (
+            <Button
+              onClick={() =>
+                send({
+                  type: "OP_REQUESTED",
+                  op: {
+                    type: "rebase",
+                    provider: opProvider,
+                  },
+                })
+              }
+              variant="outline"
+              size="sm"
+              disabled={!canRebaseAndSync || isRebaseActionPending}
+              className="mt-2 ml-2"
+            >
+              <GitMerge className="h-4 w-4 mr-2" />
+              Rebase and Sync
+            </Button>
+          )}
         </div>
       )}
-      {syncSuccess && (
-        <p className="text-green-600 mt-2">Successfully pushed to GitHub!</p>
+      {conflictRecoveryStage && (
+        <div
+          className="mt-3 rounded-lg border border-border bg-muted/35 p-3.5"
+          data-testid="github-conflict-recovery"
+        >
+          <div className="flex items-start gap-3">
+            <div className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-full bg-background text-muted-foreground ring-1 ring-border">
+              {conflictRecoveryStage === "resolving" ||
+              conflictRecoveryStage === "checking" ? (
+                <LoaderCircle
+                  className="size-4 animate-spin motion-reduce:animate-none"
+                  aria-hidden="true"
+                />
+              ) : conflictRecoveryStage === "verification-failed" ? (
+                <AlertTriangle
+                  className="size-4 text-amber-600 dark:text-amber-400"
+                  aria-hidden="true"
+                />
+              ) : conflictRecoveryStage === "ready-to-sync" ? (
+                <CircleCheck
+                  className="size-4 text-emerald-600 dark:text-emerald-400"
+                  aria-hidden="true"
+                />
+              ) : (
+                <GitMerge className="size-4" aria-hidden="true" />
+              )}
+            </div>
+            <div className="min-w-0 flex-1">
+              <div role="status" aria-live="polite" aria-atomic="true">
+                <p className="text-sm font-medium text-foreground">
+                  {conflictRecoveryStage === "resolving"
+                    ? "Resolving conflicts in chat…"
+                    : conflictRecoveryStage === "checking"
+                      ? "Verifying resolution…"
+                      : conflictRecoveryStage === "verification-failed"
+                        ? "Couldn't verify the resolution"
+                        : conflictRecoveryStage === "ready-to-sync"
+                          ? "Conflicts resolved"
+                          : isSyncConflict
+                            ? "Sync paused"
+                            : "Merge paused"}
+                </p>
+                <p className="mt-0.5 text-sm text-muted-foreground">
+                  {conflictRecoveryStage === "resolving"
+                    ? "Follow progress in the chat."
+                    : conflictRecoveryStage === "checking"
+                      ? "Checking the repository for remaining conflicts."
+                      : conflictRecoveryStage === "verification-failed"
+                        ? "Your resolved changes are still safe."
+                        : conflictRecoveryStage === "ready-to-sync"
+                          ? `Your changes are ready to sync to ${providerShortLabel}.`
+                          : `Resolve ${conflicts.length} conflict${conflicts.length === 1 ? "" : "s"} to ${isSyncConflict ? "continue syncing" : "finish merging"}.`}
+                </p>
+                {conflictRecoveryStage === "verification-failed" && (
+                  <p className="sr-only">
+                    {(
+                      conflictVerificationError ??
+                      "Dyad couldn't check the repository."
+                    )
+                      .split("\n", 1)[0]
+                      .slice(0, 240)}
+                  </p>
+                )}
+              </div>
+
+              {conflictRecoveryStage === "verification-failed" && (
+                <div className="mt-2">
+                  <GitHubOperationError
+                    message={
+                      conflictVerificationError ??
+                      "Dyad couldn't check the repository."
+                    }
+                    providerLabel={providerLabel}
+                  />
+                </div>
+              )}
+
+              {conflictRecoveryStage === "conflicted" && (
+                <ul className="mt-2 space-y-1" aria-label="Conflicted files">
+                  {conflicts.map((file) => (
+                    <li
+                      key={file}
+                      className="flex min-w-0 items-center gap-2 text-sm text-foreground"
+                    >
+                      <FileCode2
+                        className="size-4 shrink-0 text-muted-foreground"
+                        aria-hidden="true"
+                      />
+                      <span className="truncate font-mono text-xs" title={file}>
+                        {file}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              {conflictRecoveryStage === "conflicted" && (
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Button
+                    size="sm"
+                    onClick={() => void startConflictResolution()}
+                    disabled={
+                      !canResolveConflicts ||
+                      conflictResolutionClaimed ||
+                      isCancellingSync ||
+                      isResolving
+                    }
+                  >
+                    {isResolving
+                      ? "Opening chat…"
+                      : conflictResolutionClaimed
+                        ? "Opening chat…"
+                        : "Resolve with AI"}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() =>
+                      send({
+                        type: "OP_REQUESTED",
+                        op: { type: abortOperation },
+                      })
+                    }
+                    disabled={!canCancelSync || isCancellingSync || isResolving}
+                  >
+                    {isCancellingSync
+                      ? "Cancelling…"
+                      : isSyncConflict
+                        ? "Cancel sync"
+                        : "Cancel merge"}
+                  </Button>
+                </div>
+              )}
+
+              {conflictRecoveryStage === "ready-to-sync" &&
+                syncContinuationOperation && (
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <Button
+                      size="sm"
+                      disabled={!canContinueSync}
+                      onClick={() =>
+                        send({
+                          type: "OP_REQUESTED",
+                          op: syncContinuationOperation,
+                        })
+                      }
+                    >
+                      Continue to Sync
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={!canCancelSync || isCancellingSync}
+                      onClick={() =>
+                        send({
+                          type: "OP_REQUESTED",
+                          op: { type: abortOperation },
+                        })
+                      }
+                    >
+                      {isCancellingSync
+                        ? "Cancelling…"
+                        : isSyncConflict
+                          ? "Cancel sync"
+                          : "Cancel merge"}
+                    </Button>
+                  </div>
+                )}
+
+              {conflictRecoveryStage === "verification-failed" && (
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Button
+                    size="sm"
+                    disabled={!canRetryConflictVerification}
+                    onClick={() =>
+                      send({ type: "RETRY_CONFLICT_VERIFICATION" })
+                    }
+                  >
+                    Try again
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={!canCancelSync || isCancellingSync}
+                    onClick={() =>
+                      send({
+                        type: "OP_REQUESTED",
+                        op: { type: abortOperation },
+                      })
+                    }
+                  >
+                    {isCancellingSync
+                      ? "Cancelling…"
+                      : isSyncConflict
+                        ? "Cancel sync"
+                        : "Cancel merge"}
+                  </Button>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
       )}
-      {disconnectError && (
-        <p className="text-red-600 mt-2">{disconnectError}</p>
+      {banner?.kind === "info" && (
+        <p className="text-sm text-gray-700 dark:text-gray-300 mt-2">
+          {banner.message}
+        </p>
+      )}
+      {banner?.kind === "success" && (
+        <div className="mt-2" data-testid="github-sync-success" role="status">
+          <p className="text-green-600">{banner.message}</p>
+          {banner.detail && (
+            <p className="text-xs text-muted-foreground mt-0.5">
+              {banner.detail}
+            </p>
+          )}
+        </div>
+      )}
+      {banner?.kind === "warning" && (
+        <div className="mt-2" data-testid="github-sync-warning" role="status">
+          <p className="text-amber-700 dark:text-amber-400 text-sm">
+            {banner.message}
+          </p>
+          {banner.detail && (
+            <p className="text-xs text-muted-foreground mt-0.5">
+              {banner.detail}
+            </p>
+          )}
+        </div>
       )}
 
       {/* Force Push Warning Dialog */}
@@ -246,8 +695,8 @@ function ConnectedGitHubConnector({
             <DialogDescription>
               <div className="space-y-3">
                 <p>
-                  You are about to perform a <strong>force push</strong> to your
-                  GitHub repository.
+                  You are about to perform a <strong>force push</strong> to your{" "}
+                  {providerShortLabel} repository.
                 </p>
                 <div className="bg-orange-50 dark:bg-orange-900/20 p-3 rounded-md border border-orange-200 dark:border-orange-800">
                   <p className="text-sm text-orange-800 dark:text-orange-200">
@@ -275,8 +724,18 @@ function ConnectedGitHubConnector({
             </Button>
             <Button
               variant="destructive"
-              onClick={() => handleSyncToGithub(true)}
-              disabled={isSyncing}
+              onClick={() => {
+                setShowForceDialog(false);
+                send({
+                  type: "OP_REQUESTED",
+                  op: {
+                    type: "push",
+                    mode: "force",
+                    provider: opProvider,
+                  },
+                });
+              }}
+              disabled={!canForcePush || isOperationInFlight}
             >
               {isSyncing ? "Force Pushing..." : "Force Push"}
             </Button>
@@ -287,28 +746,56 @@ function ConnectedGitHubConnector({
   );
 }
 
-function UnconnectedGitHubConnector({
+export function UnconnectedGitHubConnector({
   appId,
   folderName,
   settings,
   refreshSettings,
-  handleRepoSetupComplete,
   expanded,
+  linkedRepo,
 }: UnconnectedGitHubConnectorProps) {
+  const { projection, send, connection } = useGithubOps(appId, {
+    reconcileOnMount: linkedRepo !== undefined,
+  });
+  const { canConnectRepository } = projection.capabilities;
   // --- Collapsible State ---
   const [isExpanded, setIsExpanded] = useState(expanded || false);
 
   // --- GitHub Device Flow State ---
-  const [githubUserCode, setGithubUserCode] = useState<string | null>(null);
-  const [githubVerificationUri, setGithubVerificationUri] = useState<
-    string | null
-  >(null);
-  const [githubError, setGithubError] = useState<string | null>(null);
-  const [isConnectingToGithub, setIsConnectingToGithub] = useState(false);
-  const [githubStatusMessage, setGithubStatusMessage] = useState<string | null>(
-    null,
-  );
+  // The flow itself lives in the main process (typed-ref-correlated state
+  // machine); this component only projects it. Unmounting and remounting
+  // re-projects the current flow, so a device poll that succeeds while this
+  // component is unmounted is still reflected in the UI.
+  const { flowState: githubFlowState, isFlowActive: isConnectingToGithub } =
+    useConnectionFlow("github");
   const [codeCopied, setCodeCopied] = useState(false);
+
+  const githubUserCode =
+    githubFlowState.status === "awaiting-return"
+      ? (githubFlowState.userCode ?? null)
+      : null;
+  const githubVerificationUri =
+    githubFlowState.status === "awaiting-return"
+      ? (githubFlowState.verificationUri ?? null)
+      : null;
+  const githubError =
+    githubFlowState.status === "failed"
+      ? (githubFlowState.message ?? "An unknown error occurred.")
+      : null;
+  const githubStatusMessage = (() => {
+    switch (githubFlowState.status) {
+      case "starting":
+        return "Requesting device code from GitHub...";
+      case "awaiting-return":
+        return "Please authorize in your browser.";
+      case "exchanging-token":
+        return "Connecting to GitHub...";
+      case "connected":
+        return "Successfully connected to GitHub!";
+      default:
+        return null;
+    }
+  })();
 
   // --- Repo Setup State ---
   const [repoSetupMode, setRepoSetupMode] = useState<"create" | "existing">(
@@ -327,14 +814,18 @@ function UnconnectedGitHubConnector({
   );
   const [customBranchName, setCustomBranchName] = useState<string>("");
 
-  // Create new repo state
-  const [repoName, setRepoName] = useState(folderName);
+  // Create new repo state. Seed with a kebab-case slug of the app name (the
+  // same transform used for the app folder path) so the repo name is a valid
+  // Vercel project name by default.
+  const [repoName, setRepoName] = useState(() => slugifyAppPath(folderName));
   const [repoAvailable, setRepoAvailable] = useState<boolean | null>(null);
   const [repoCheckError, setRepoCheckError] = useState<string | null>(null);
   const [isCheckingRepo, setIsCheckingRepo] = useState(false);
-  const [isCreatingRepo, setIsCreatingRepo] = useState(false);
-  const [createRepoError, setCreateRepoError] = useState<string | null>(null);
-  const [createRepoSuccess, setCreateRepoSuccess] = useState<boolean>(false);
+  const isCreatingRepo = projection.runningOperation?.type === "connect-repo";
+  const createRepoError =
+    projection.banner?.kind === "error" ? projection.banner.message : null;
+  const createRepoSuccess =
+    projection.banner?.kind === "success" ? projection.banner.message : null;
 
   // Assume org is the authenticated user for now (could add org input later)
   const githubOrg = ""; // Use empty string for now (GitHub API will default to the authenticated user)
@@ -342,85 +833,36 @@ function UnconnectedGitHubConnector({
   const debounceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const handleConnectToGithub = async () => {
-    if (!appId) return;
-    setIsConnectingToGithub(true);
-    setGithubError(null);
-    setGithubUserCode(null);
-    setGithubVerificationUri(null);
-    setGithubStatusMessage("Requesting device code from GitHub...");
-
-    // Send IPC message to main process to start the flow
-    IpcClient.getInstance().startGithubDeviceFlow(appId);
+    // Starting is a no-op while a flow is already active (double-click).
+    await startConnectionFlow("github", { appId });
   };
 
+  const refreshSettingsRef = useRef(refreshSettings);
+  refreshSettingsRef.current = refreshSettings;
+
   useEffect(() => {
-    if (!appId) return; // Don't set up listeners if appId is null initially
-
-    const cleanupFunctions: (() => void)[] = [];
-
-    // Listener for updates (user code, verification uri, status messages)
-    const removeUpdateListener =
-      IpcClient.getInstance().onGithubDeviceFlowUpdate((data) => {
-        console.log("Received github:flow-update", data);
-        if (data.userCode) {
-          setGithubUserCode(data.userCode);
+    const flow = githubFlowState;
+    if (flow.status === "connected") {
+      setIsExpanded(true);
+      void (async () => {
+        try {
+          await refreshSettingsRef.current();
+        } finally {
+          await acknowledgeConnectionFlow("github", flow.invocationRef);
         }
-        if (data.verificationUri) {
-          setGithubVerificationUri(data.verificationUri);
-        }
-        if (data.message) {
-          setGithubStatusMessage(data.message);
-        }
+      })();
+    } else if (flow.status === "cancelled") {
+      void acknowledgeConnectionFlow("github", flow.invocationRef);
+    }
+    // `failed` is deliberately not acknowledged: the error stays visible
+    // until the user retries (starting a new flow is allowed from `failed`).
+  }, [githubFlowState]);
 
-        setGithubError(null); // Clear previous errors on new update
-        if (!data.userCode && !data.verificationUri && data.message) {
-          // Likely just a status message, keep connecting state
-          setIsConnectingToGithub(true);
-        }
-        if (data.userCode && data.verificationUri) {
-          setIsConnectingToGithub(true); // Still connecting until success/error
-        }
-      });
-    cleanupFunctions.push(removeUpdateListener);
-
-    // Listener for success
-    const removeSuccessListener =
-      IpcClient.getInstance().onGithubDeviceFlowSuccess((data) => {
-        console.log("Received github:flow-success", data);
-        setGithubStatusMessage("Successfully connected to GitHub!");
-        setGithubUserCode(null); // Clear user-facing info
-        setGithubVerificationUri(null);
-        setGithubError(null);
-        setIsConnectingToGithub(false);
-        refreshSettings();
-        setIsExpanded(true);
-      });
-    cleanupFunctions.push(removeSuccessListener);
-
-    // Listener for errors
-    const removeErrorListener = IpcClient.getInstance().onGithubDeviceFlowError(
-      (data) => {
-        console.log("Received github:flow-error", data);
-        setGithubError(data.error || "An unknown error occurred.");
-        setGithubStatusMessage(null);
-        setGithubUserCode(null);
-        setGithubVerificationUri(null);
-        setIsConnectingToGithub(false);
-      },
-    );
-    cleanupFunctions.push(removeErrorListener);
-
-    // Cleanup function to remove all listeners when component unmounts or appId changes
-    return () => {
-      cleanupFunctions.forEach((cleanup) => cleanup());
-      // Reset state when appId changes or component unmounts
-      setGithubUserCode(null);
-      setGithubVerificationUri(null);
-      setGithubError(null);
-      setIsConnectingToGithub(false);
-      setGithubStatusMessage(null);
-    };
-  }, [appId]); // Re-run effect if appId changes
+  // A token that was written with no active flow (e.g. the user cancelled
+  // while GitHub was already authorizing): refresh so the UI reflects it.
+  useUnsolicitedConnectionReturn("github", () => {
+    void refreshSettingsRef.current();
+  });
 
   // Load available repos when GitHub is connected
   useEffect(() => {
@@ -432,7 +874,7 @@ function UnconnectedGitHubConnector({
   const loadAvailableRepos = async () => {
     setIsLoadingRepos(true);
     try {
-      const repos = await IpcClient.getInstance().listGithubRepos();
+      const repos = await ipc.github.listRepos();
       setAvailableRepos(repos);
     } catch (error) {
       console.error("Failed to load GitHub repos:", error);
@@ -456,10 +898,7 @@ function UnconnectedGitHubConnector({
     setCustomBranchName(""); // Clear custom branch name
     try {
       const [owner, repo] = selectedRepo.split("/");
-      const branches = await IpcClient.getInstance().getGithubRepoBranches(
-        owner,
-        repo,
-      );
+      const branches = await ipc.github.getRepoBranches({ owner, repo });
       setAvailableBranches(branches);
       // Default to main if available, otherwise first branch
       const defaultBranch =
@@ -482,10 +921,10 @@ function UnconnectedGitHubConnector({
       if (!name) return;
       setIsCheckingRepo(true);
       try {
-        const result = await IpcClient.getInstance().checkGithubRepoAvailable(
-          githubOrg,
-          name,
-        );
+        const result = await ipc.github.isRepoAvailable({
+          org: githubOrg,
+          repo: name,
+        });
         setRepoAvailable(result.available);
         if (!result.available) {
           setRepoCheckError(
@@ -513,56 +952,60 @@ function UnconnectedGitHubConnector({
     [checkRepoAvailability],
   );
 
-  const handleSetupRepo = async (e: React.FormEvent) => {
+  const handleSetupRepo = (e: React.FormEvent) => {
     e.preventDefault();
     if (!appId) return;
 
-    setCreateRepoError(null);
-    setIsCreatingRepo(true);
-    setCreateRepoSuccess(false);
-
-    try {
-      if (repoSetupMode === "create") {
-        await IpcClient.getInstance().createGithubRepo(
-          githubOrg,
-          repoName,
-          appId,
-          selectedBranch,
-        );
-      } else {
-        const [owner, repo] = selectedRepo.split("/");
-        const branchToUse =
-          branchInputMode === "custom" ? customBranchName : selectedBranch;
-        await IpcClient.getInstance().connectToExistingGithubRepo(
+    if (repoSetupMode === "create") {
+      send({
+        type: "OP_REQUESTED",
+        op: {
+          type: "connect-repo",
+          provider: "github",
+          mode: "create",
+          org: githubOrg,
+          repo: repoName,
+          branch: selectedBranch,
+          thenAutoPush: true,
+        },
+      });
+    } else {
+      const [owner, repo] = selectedRepo.split("/");
+      const branchToUse =
+        branchInputMode === "custom" ? customBranchName : selectedBranch;
+      send({
+        type: "OP_REQUESTED",
+        op: {
+          type: "connect-repo",
+          provider: "github",
+          mode: "existing",
           owner,
           repo,
-          branchToUse,
-          appId,
-        );
-      }
-
-      setCreateRepoSuccess(true);
-      setRepoCheckError(null);
-      handleRepoSetupComplete();
-    } catch (err: any) {
-      setCreateRepoError(
-        err.message ||
-          `Failed to ${repoSetupMode === "create" ? "create" : "connect to"} repository.`,
-      );
-    } finally {
-      setIsCreatingRepo(false);
+          branch: branchToUse,
+          thenAutoPush: true,
+        },
+      });
     }
   };
 
   if (!settings?.githubAccessToken) {
     return (
       <div className="mt-1 w-full" data-testid="github-unconnected-repo">
+        {linkedRepo && (
+          <div className="mb-3 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-100">
+            <p className="font-medium">Reconnect your GitHub account</p>
+            <p className="mt-1">
+              This app is linked to {linkedRepo.org}/{linkedRepo.repo}, but
+              GitHub credentials are missing from settings.
+            </p>
+          </div>
+        )}
         <Button
           onClick={handleConnectToGithub}
           className="cursor-pointer w-full py-5 flex justify-center items-center gap-2"
           size="lg"
           variant="outline"
-          disabled={isConnectingToGithub || !appId} // Also disable if appId is null
+          disabled={isConnectingToGithub} // Also disable if appId is null
         >
           Connect to GitHub
           <Github className="h-5 w-5" />
@@ -589,6 +1032,7 @@ function UnconnectedGitHubConnector({
             </svg>
           )}
         </Button>
+
         {/* GitHub Connection Status/Instructions */}
         {(githubUserCode || githubStatusMessage || githubError) && (
           <div className="mt-6 p-4 border rounded-md bg-gray-50 dark:bg-gray-700/50 border-gray-200 dark:border-gray-600">
@@ -606,9 +1050,7 @@ function UnconnectedGitHubConnector({
                     href={githubVerificationUri} // Make it a direct link
                     onClick={(e) => {
                       e.preventDefault();
-                      IpcClient.getInstance().openExternalUrl(
-                        githubVerificationUri,
-                      );
+                      ipc.system.openExternalUrl(githubVerificationUri);
                     }}
                     target="_blank"
                     rel="noopener noreferrer"
@@ -653,6 +1095,23 @@ function UnconnectedGitHubConnector({
                 {githubStatusMessage}
               </p>
             )}
+            {isConnectingToGithub && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="mt-3"
+                onClick={() => {
+                  if ("invocationRef" in githubFlowState) {
+                    void cancelConnectionFlow(
+                      "github",
+                      githubFlowState.invocationRef,
+                    );
+                  }
+                }}
+              >
+                Cancel
+              </Button>
+            )}
           </div>
         )}
       </div>
@@ -661,6 +1120,13 @@ function UnconnectedGitHubConnector({
 
   return (
     <div className="w-full" data-testid="github-setup-repo">
+      {connection !== "ready" && (
+        <p className="px-4 pt-2 text-sm text-muted-foreground">
+          {connection === "connecting"
+            ? "Loading GitHub controls…"
+            : "GitHub controls are temporarily unavailable."}
+        </p>
+      )}
       {/* Collapsible Header */}
       <button
         type="button"
@@ -686,40 +1152,18 @@ function UnconnectedGitHubConnector({
         <div className="p-4 pt-0 space-y-4">
           {/* Mode Selection */}
           <div>
-            <div className="flex rounded-md border border-gray-200 dark:border-gray-700">
-              <Button
-                type="button"
-                variant={repoSetupMode === "create" ? "default" : "ghost"}
-                className={`flex-1 rounded-none rounded-l-md border-0 ${
-                  repoSetupMode === "create"
-                    ? "bg-primary text-primary-foreground"
-                    : "hover:bg-gray-50 dark:hover:bg-gray-800"
-                }`}
-                onClick={() => {
-                  setRepoSetupMode("create");
-                  setCreateRepoError(null);
-                  setCreateRepoSuccess(false);
-                }}
-              >
-                Create new repo
-              </Button>
-              <Button
-                type="button"
-                variant={repoSetupMode === "existing" ? "default" : "ghost"}
-                className={`flex-1 rounded-none rounded-r-md border-0 border-l border-gray-200 dark:border-gray-700 ${
-                  repoSetupMode === "existing"
-                    ? "bg-primary text-primary-foreground"
-                    : "hover:bg-gray-50 dark:hover:bg-gray-800"
-                }`}
-                onClick={() => {
-                  setRepoSetupMode("existing");
-                  setCreateRepoError(null);
-                  setCreateRepoSuccess(false);
-                }}
-              >
-                Connect to existing repo
-              </Button>
-            </div>
+            <SegmentedChoice
+              ariaLabel="How to link this app to GitHub"
+              value={repoSetupMode}
+              onChange={(next) => {
+                setRepoSetupMode(next);
+                send({ type: "BANNER_DISMISSED" });
+              }}
+              options={[
+                { value: "create", label: "Create new repo" },
+                { value: "existing", label: "Connect to existing repo" },
+              ]}
+            />
           </div>
 
           <form className="space-y-4" onSubmit={handleSetupRepo}>
@@ -767,7 +1211,7 @@ function UnconnectedGitHubConnector({
                   </Label>
                   <Select
                     value={selectedRepo}
-                    onValueChange={setSelectedRepo}
+                    onValueChange={(v) => setSelectedRepo(v ?? "")}
                     disabled={isLoadingRepos}
                   >
                     <SelectTrigger
@@ -807,7 +1251,7 @@ function UnconnectedGitHubConnector({
                       if (value === "custom") {
                         setBranchInputMode("custom");
                         setCustomBranchName("");
-                      } else {
+                      } else if (value) {
                         setBranchInputMode("select");
                         setSelectedBranch(value);
                       }
@@ -865,6 +1309,7 @@ function UnconnectedGitHubConnector({
             <Button
               type="submit"
               disabled={
+                !canConnectRepository ||
                 isCreatingRepo ||
                 (repoSetupMode === "create" &&
                   (repoAvailable === false || !repoName)) ||
@@ -885,14 +1330,12 @@ function UnconnectedGitHubConnector({
           </form>
 
           {createRepoError && (
-            <p className="text-red-600 mt-2">{createRepoError}</p>
+            <div className="mt-2">
+              <GitHubOperationError message={createRepoError} />
+            </div>
           )}
           {createRepoSuccess && (
-            <p className="text-green-600 mt-2">
-              {repoSetupMode === "create"
-                ? "Repository created and linked!"
-                : "Connected to repository!"}
-            </p>
+            <p className="text-green-600 mt-2">{createRepoSuccess}</p>
           )}
         </div>
       </div>
@@ -905,29 +1348,16 @@ export function GitHubConnector({
   folderName,
   expanded,
 }: GitHubConnectorProps) {
-  const { app, refreshApp } = useLoadApp(appId);
+  const { app } = useLoadApp(appId);
   const { settings, refreshSettings } = useSettings();
-  const [pendingAutoSync, setPendingAutoSync] = useState(false);
+  const linkedRepo =
+    app?.githubOrg && app?.githubRepo
+      ? { org: app.githubOrg, repo: app.githubRepo }
+      : undefined;
+  const hasGitHubCredentials = !!settings?.githubAccessToken;
 
-  const handleRepoSetupComplete = useCallback(() => {
-    setPendingAutoSync(true);
-    refreshApp();
-  }, [refreshApp]);
-
-  const handleAutoSyncComplete = useCallback(() => {
-    setPendingAutoSync(false);
-  }, []);
-
-  if (app?.githubOrg && app?.githubRepo && appId) {
-    return (
-      <ConnectedGitHubConnector
-        appId={appId}
-        app={app}
-        refreshApp={refreshApp}
-        triggerAutoSync={pendingAutoSync}
-        onAutoSyncComplete={handleAutoSyncComplete}
-      />
-    );
+  if (linkedRepo && hasGitHubCredentials && appId) {
+    return <ConnectedGitHubConnector appId={appId} app={app} />;
   } else {
     return (
       <UnconnectedGitHubConnector
@@ -935,8 +1365,8 @@ export function GitHubConnector({
         folderName={folderName}
         settings={settings}
         refreshSettings={refreshSettings}
-        handleRepoSetupComplete={handleRepoSetupComplete}
         expanded={expanded}
+        linkedRepo={linkedRepo}
       />
     );
   }

@@ -2,9 +2,16 @@
 name: Bug report
 about: Create a report to help us improve
 title: ""
-labels: ""
+labels: "bug"
 assignees: ""
 ---
+
+<!--
+We recommend filing bugs from the app because it automatically includes logs and system info!
+https://www.dyad.sh/docs/help#report-a-bug
+
+Please fill in all fields in English.
+-->
 
 **Describe the bug**
 A clear and concise description of what the bug is.

@@ -1,45 +1,99 @@
-import { ipcMain, IpcMainInvokeEvent } from "electron";
-import { Vercel } from "@vercel/sdk";
+import { IpcMainInvokeEvent } from "electron";
 import { writeSettings, readSettings } from "../../main/settings";
 import * as schema from "../../db/schema";
 import { db } from "../../db";
 import { apps } from "../../db/schema";
 import { eq } from "drizzle-orm";
 import log from "electron-log";
-import { IS_TEST_BUILD } from "../utils/test_utils";
+import {
+  createVercelClient,
+  VERCEL_API_BASE,
+  type VercelProjectFramework,
+} from "../utils/vercel_utils";
+import {
+  getVercelDeploymentError,
+  getVercelProjectCreationError,
+} from "../utils/vercel_errors";
 import * as fs from "fs";
 import * as path from "path";
-import { CreateProjectFramework } from "@vercel/sdk/models/createprojectop.js";
 import { getDyadAppPath } from "@/paths/paths";
+import { slugifyAppPath } from "@/shared/slugify";
+import { createTypedHandler } from "./base";
 import {
-  CreateVercelProjectParams,
-  IsVercelProjectAvailableParams,
+  vercelContracts,
   SaveVercelAccessTokenParams,
-  VercelDeployment,
+  IsVercelProjectAvailableParams,
+  CreateVercelProjectParams,
+  CreateVercelProjectResult,
+  ConnectToExistingVercelProjectParams,
+  GetVercelDeploymentsParams,
+  CreateVercelDeploymentParams,
+  DisconnectVercelProjectParams,
   VercelProject,
-} from "../ipc_types";
-import { ConnectToExistingVercelProjectParams } from "../ipc_types";
-import { GetVercelDeploymentsParams } from "../ipc_types";
-import { DisconnectVercelProjectParams } from "../ipc_types";
-import { createLoggedHandler } from "./safe_handle";
+  VercelDeployment,
+} from "../types/vercel";
+import {
+  previewNeonVercelSync,
+  syncNeonConfigToVercel,
+  removeNeonEnvVarsFromVercel,
+} from "../utils/vercel_neon_sync";
+import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
+import {
+  getVercelProjectTeamId,
+  withVercelTeamScope,
+} from "../utils/vercel_project_scope";
 
 const logger = log.scope("vercel_handlers");
-const handle = createLoggedHandler(logger);
-
-// Use test server URLs when in test mode
-const TEST_SERVER_BASE = "http://localhost:3500";
-
-const VERCEL_API_BASE = IS_TEST_BUILD
-  ? `${TEST_SERVER_BASE}/vercel/api`
-  : "https://api.vercel.com";
 
 // --- Helper Functions ---
 
-function createVercelClient(token: string): Vercel {
-  return new Vercel({
-    bearerToken: token,
-    ...(IS_TEST_BUILD && { serverURL: VERCEL_API_BASE }),
+interface VercelProjectResponse {
+  id: string;
+  name: string;
+  accountId: string;
+  framework?: string | null;
+  targets?: {
+    production?: {
+      url?: string;
+    };
+  };
+}
+
+interface GetVercelProjectsResponse {
+  projects: VercelProjectResponse[];
+}
+
+/**
+ * Fetch Vercel projects via HTTP request (bypasses the broken SDK).
+ * Mimics the SDK's `vercel.projects.getProjects` API.
+ */
+async function getVercelProjects(
+  token: string,
+  options?: { search?: string },
+): Promise<GetVercelProjectsResponse> {
+  const url = new URL(`${VERCEL_API_BASE}/v9/projects`);
+  if (options?.search) {
+    url.searchParams.set("search", options.search);
+  }
+
+  const response = await fetch(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
   });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      `Failed to fetch Vercel projects: ${response.status} ${response.statusText} - ${errorText}`,
+    );
+  }
+
+  const data = await response.json();
+  return {
+    projects: data.projects || [],
+  };
 }
 
 async function validateVercelToken(token: string): Promise<boolean> {
@@ -53,43 +107,14 @@ async function validateVercelToken(token: string): Promise<boolean> {
   }
 }
 
-async function getDefaultTeamId(token: string): Promise<string> {
-  try {
-    const response = await fetch(`${VERCEL_API_BASE}/v2/teams?limit=1`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-    });
-
-    if (!response.ok) {
-      throw new Error(
-        `Failed to fetch teams: ${response.status} ${response.statusText}`,
-      );
-    }
-
-    const data = await response.json();
-
-    // Use the first team (typically the personal account or default team)
-    if (data.teams && data.teams.length > 0) {
-      return data.teams[0].id;
-    }
-
-    throw new Error("No teams found for this user");
-  } catch (error) {
-    logger.error("Error getting default team ID:", error);
-    throw new Error("Failed to get team information");
-  }
-}
-
 async function detectFramework(
   appPath: string,
-): Promise<CreateProjectFramework | undefined> {
+): Promise<VercelProjectFramework | undefined> {
   try {
     // Check for specific config files first
     const configFiles: Array<{
       file: string;
-      framework: CreateProjectFramework;
+      framework: VercelProjectFramework;
     }> = [
       { file: "next.config.js", framework: "nextjs" },
       { file: "next.config.mjs", framework: "nextjs" },
@@ -150,7 +175,7 @@ async function handleSaveVercelToken(
   logger.debug("Saving Vercel access token");
 
   if (!token || token.trim() === "") {
-    throw new Error("Access token is required.");
+    throw new DyadError("Access token is required.", DyadErrorKind.Auth);
   }
 
   try {
@@ -171,7 +196,10 @@ async function handleSaveVercelToken(
     logger.log("Successfully saved Vercel access token.");
   } catch (error: any) {
     logger.error("Error saving Vercel token:", error);
-    throw new Error(`Failed to save access token: ${error.message}`);
+    throw new DyadError(
+      `Failed to save access token: ${error.message}`,
+      DyadErrorKind.Auth,
+    );
   }
 }
 
@@ -181,14 +209,16 @@ async function handleListVercelProjects(): Promise<VercelProject[]> {
     const settings = readSettings();
     const accessToken = settings.vercelAccessToken?.value;
     if (!accessToken) {
-      throw new Error("Not authenticated with Vercel.");
+      throw new DyadError("Not authenticated with Vercel.", DyadErrorKind.Auth);
     }
 
-    const vercel = createVercelClient(accessToken);
-    const response = await vercel.projects.getProjects({});
+    const response = await getVercelProjects(accessToken);
 
     if (!response.projects) {
-      throw new Error("Failed to retrieve projects from Vercel.");
+      throw new DyadError(
+        "Failed to retrieve projects from Vercel.",
+        DyadErrorKind.External,
+      );
     }
 
     return response.projects.map((project) => ({
@@ -197,6 +227,7 @@ async function handleListVercelProjects(): Promise<VercelProject[]> {
       framework: project.framework || null,
     }));
   } catch (err: any) {
+    if (err instanceof DyadError) throw err;
     logger.error("[Vercel Handler] Failed to list projects:", err);
     throw new Error(err.message || "Failed to list Vercel projects.");
   }
@@ -205,8 +236,11 @@ async function handleListVercelProjects(): Promise<VercelProject[]> {
 // --- Vercel Project Availability Handler ---
 async function handleIsProjectAvailable(
   event: IpcMainInvokeEvent,
-  { name }: IsVercelProjectAvailableParams,
+  { name: rawName }: IsVercelProjectAvailableParams,
 ): Promise<{ available: boolean; error?: string }> {
+  // Normalize to the same kebab-case slug `handleCreateProject` will use, so
+  // the availability check reflects the name that will actually be created.
+  const name = slugifyAppPath(rawName);
   try {
     const settings = readSettings();
     const accessToken = settings.vercelAccessToken?.value;
@@ -214,12 +248,8 @@ async function handleIsProjectAvailable(
       return { available: false, error: "Not authenticated with Vercel." };
     }
 
-    const vercel = createVercelClient(accessToken);
-
     // Check if project name is available by searching for projects with that name
-    const response = await vercel.projects.getProjects({
-      search: name,
-    });
+    const response = await getVercelProjects(accessToken, { search: name });
 
     if (!response.projects) {
       return {
@@ -244,12 +274,15 @@ async function handleIsProjectAvailable(
 // --- Vercel Create Project Handler ---
 async function handleCreateProject(
   event: IpcMainInvokeEvent,
-  { name, appId }: CreateVercelProjectParams,
-): Promise<void> {
+  { name: rawName, appId, deferDeployment }: CreateVercelProjectParams,
+): Promise<CreateVercelProjectResult> {
+  // Normalize to a kebab-case slug so the project name is valid for Vercel
+  // (which requires lowercase names) regardless of how it was entered.
+  const name = slugifyAppPath(rawName);
   const settings = readSettings();
   const accessToken = settings.vercelAccessToken?.value;
   if (!accessToken) {
-    throw new Error("Not authenticated with Vercel.");
+    throw new DyadError("Not authenticated with Vercel.", DyadErrorKind.Auth);
   }
 
   try {
@@ -258,7 +291,7 @@ async function handleCreateProject(
     // Get app details to determine the framework
     const app = await db.query.apps.findFirst({ where: eq(apps.id, appId) });
     if (!app) {
-      throw new Error("App not found.");
+      throw new DyadError("App not found.", DyadErrorKind.NotFound);
     }
 
     // Check if app has GitHub repository configured
@@ -288,14 +321,17 @@ async function handleCreateProject(
       },
     });
     if (!projectData.id) {
-      throw new Error("Failed to create project: No project ID returned.");
+      throw new DyadError(
+        "Failed to create project: No project ID returned.",
+        DyadErrorKind.External,
+      );
     }
 
-    // Get the default team ID
-    const teamId = await getDefaultTeamId(accessToken);
+    const teamId = getVercelProjectTeamId(projectData);
 
     const projectDomains = await vercel.projects.getProjectDomains({
       idOrName: projectData.id,
+      teamId: teamId ?? undefined,
     });
     const projectUrl = "https://" + projectDomains.domains[0].name;
 
@@ -312,11 +348,36 @@ async function handleCreateProject(
       `Successfully created Vercel project: ${projectData.id} with GitHub repo: ${app.githubOrg}/${app.githubRepo}`,
     );
 
+    // The guided flow owns env setup and the build it verifies. Other callers
+    // retain the existing first-deploy behavior below.
+    if (deferDeployment) return;
+
+    // First-deploy auto-config: for Neon-connected apps, push env vars and add
+    // the new deployment domain to Neon Auth's trusted domains BEFORE the first
+    // build runs so it picks them up. Non-fatal, like the deployment trigger.
+    let syncWarning: string | undefined;
+    if (app.neonProjectId) {
+      try {
+        const syncResult = await syncNeonConfigToVercel({
+          appId,
+          includeDomainHosts: [projectUrl],
+        });
+        syncWarning = syncResult.warning;
+      } catch (syncError: any) {
+        logger.warn(
+          `Neon→Vercel sync failed during project creation: ${syncError.message}`,
+        );
+        syncWarning =
+          syncError.message || "Failed to sync Neon config to Vercel.";
+      }
+    }
+
     // Trigger the first deployment
     logger.info(`Triggering first deployment for project: ${projectData.id}`);
     try {
       // Create deployment via Vercel SDK using the project settings we just created
       const deploymentData = await vercel.deployments.createDeployment({
+        teamId: teamId ?? undefined,
         requestBody: {
           name: projectData.name,
           project: projectData.id,
@@ -330,7 +391,7 @@ async function handleCreateProject(
         },
       });
 
-      if (deploymentData.url) {
+      if ("url" in deploymentData && deploymentData.url) {
         logger.info(`First deployment successful: ${deploymentData.url}`);
       } else {
         logger.warn("First deployment failed: No deployment URL returned");
@@ -339,9 +400,12 @@ async function handleCreateProject(
       logger.warn(`First deployment failed with error: ${deployError.message}`);
       // Don't throw here - project creation was successful, deployment failure is non-critical
     }
+
+    return syncWarning ? { syncWarning } : undefined;
   } catch (err: any) {
+    if (err instanceof DyadError) throw err;
     logger.error("[Vercel Handler] Failed to create project:", err);
-    throw new Error(err.message || "Failed to create Vercel project.");
+    throw getVercelProjectCreationError(err);
   }
 }
 
@@ -354,27 +418,27 @@ async function handleConnectToExistingProject(
     const settings = readSettings();
     const accessToken = settings.vercelAccessToken?.value;
     if (!accessToken) {
-      throw new Error("Not authenticated with Vercel.");
+      throw new DyadError("Not authenticated with Vercel.", DyadErrorKind.Auth);
     }
 
     logger.info(
       `Connecting to existing Vercel project: ${projectId} for app ${appId}`,
     );
 
-    const vercel = createVercelClient(accessToken);
-
     // Verify the project exists and get its details
-    const response = await vercel.projects.getProjects({});
+    const response = await getVercelProjects(accessToken);
     const projectData = response.projects?.find(
       (p) => p.id === projectId || p.name === projectId,
     );
 
     if (!projectData) {
-      throw new Error("Project not found. Please check the project ID.");
+      throw new DyadError(
+        "Project not found. Please check the project ID.",
+        DyadErrorKind.NotFound,
+      );
     }
 
-    // Get the default team ID
-    const teamId = await getDefaultTeamId(accessToken);
+    const teamId = getVercelProjectTeamId(projectData);
 
     // Store project info in the app's DB row
     await updateAppVercelProject({
@@ -389,6 +453,7 @@ async function handleConnectToExistingProject(
 
     logger.info(`Successfully connected to Vercel project: ${projectData.id}`);
   } catch (err: any) {
+    if (err instanceof DyadError) throw err;
     logger.error(
       "[Vercel Handler] Failed to connect to existing project:",
       err,
@@ -406,12 +471,15 @@ async function handleGetVercelDeployments(
     const settings = readSettings();
     const accessToken = settings.vercelAccessToken?.value;
     if (!accessToken) {
-      throw new Error("Not authenticated with Vercel.");
+      throw new DyadError("Not authenticated with Vercel.", DyadErrorKind.Auth);
     }
 
     const app = await db.query.apps.findFirst({ where: eq(apps.id, appId) });
     if (!app || !app.vercelProjectId) {
-      throw new Error("App is not linked to a Vercel project.");
+      throw new DyadError(
+        "App is not linked to a Vercel project.",
+        DyadErrorKind.Precondition,
+      );
     }
 
     logger.info(
@@ -421,13 +489,40 @@ async function handleGetVercelDeployments(
     const vercel = createVercelClient(accessToken);
 
     // Get deployments for the project
-    const deploymentsResponse = await vercel.deployments.getDeployments({
-      projectId: app.vercelProjectId,
-      limit: 3, // Get last 3 deployments
-    });
+    const deploymentsResponse = await withVercelTeamScope(
+      app.vercelTeamId,
+      (teamId) =>
+        vercel.deployments.getDeployments({
+          projectId: app.vercelProjectId!,
+          teamId,
+          limit: 5, // Get last 5 deployments
+        }),
+    );
 
     if (!deploymentsResponse.deployments) {
-      throw new Error("Failed to retrieve deployments from Vercel.");
+      throw new DyadError(
+        "Failed to retrieve deployments from Vercel.",
+        DyadErrorKind.External,
+      );
+    }
+
+    // Find the most recent READY production deployment and update the stored URL
+    const readyProductionDeployment = deploymentsResponse.deployments.find(
+      (d) => d.readyState === "READY" && d.target === "production",
+    );
+
+    if (readyProductionDeployment?.url) {
+      const newDeploymentUrl = `https://${readyProductionDeployment.url}`;
+      // Only update if the URL has changed
+      if (newDeploymentUrl !== app.vercelDeploymentUrl) {
+        logger.info(
+          `Updating deployment URL for app ${appId}: ${app.vercelDeploymentUrl} -> ${newDeploymentUrl}`,
+        );
+        await db
+          .update(apps)
+          .set({ vercelDeploymentUrl: newDeploymentUrl })
+          .where(eq(apps.id, appId));
+      }
     }
 
     // Map deployments to our interface format
@@ -440,8 +535,67 @@ async function handleGetVercelDeployments(
       readyState: deployment.readyState || "unknown",
     }));
   } catch (err: any) {
+    if (err instanceof DyadError) throw err;
     logger.error("[Vercel Handler] Failed to get deployments:", err);
     throw new Error(err.message || "Failed to get Vercel deployments.");
+  }
+}
+
+// --- Vercel Create Deployment Handler ---
+// Vercel applies environment variables only to builds that start after they
+// are set, so a connected project's latest deployment can predate them.
+async function handleCreateVercelDeployment(
+  event: IpcMainInvokeEvent,
+  { appId }: CreateVercelDeploymentParams,
+): Promise<{ uid: string }> {
+  try {
+    const accessToken = readSettings().vercelAccessToken?.value;
+    if (!accessToken) {
+      throw new DyadError("Not authenticated with Vercel.", DyadErrorKind.Auth);
+    }
+
+    const app = await db.query.apps.findFirst({ where: eq(apps.id, appId) });
+    if (!app?.vercelProjectId) {
+      throw new DyadError(
+        "App is not linked to a Vercel project.",
+        DyadErrorKind.Precondition,
+      );
+    }
+    if (!app.githubOrg || !app.githubRepo) {
+      throw new DyadError(
+        "Connect a GitHub repository before deploying to Vercel.",
+        DyadErrorKind.Precondition,
+      );
+    }
+
+    logger.info(
+      `Creating deployment for Vercel project: ${app.vercelProjectId} for app ${appId}`,
+    );
+    const projectId = app.vercelProjectId;
+    const owner = app.githubOrg;
+    const repo = app.githubRepo;
+    const vercel = createVercelClient(accessToken);
+    const deployment = await withVercelTeamScope(app.vercelTeamId, (teamId) =>
+      vercel.deployments.createDeployment({
+        teamId,
+        requestBody: {
+          name: app.vercelProjectName ?? projectId,
+          project: projectId,
+          target: "production",
+          gitSource: {
+            type: "github",
+            org: owner,
+            repo,
+            ref: app.githubBranch || "main",
+          },
+        },
+      }),
+    );
+    return { uid: deployment.id };
+  } catch (err: any) {
+    if (err instanceof DyadError) throw err;
+    logger.error("[Vercel Handler] Failed to create deployment:", err);
+    throw getVercelDeploymentError(err);
   }
 }
 
@@ -456,7 +610,7 @@ async function handleDisconnectVercelProject(
   });
 
   if (!app) {
-    throw new Error("App not found");
+    throw new DyadError("App not found", DyadErrorKind.NotFound);
   }
 
   // Update app in database to remove Vercel project info
@@ -474,15 +628,67 @@ async function handleDisconnectVercelProject(
 // --- Registration ---
 export function registerVercelHandlers() {
   // DO NOT LOG this handler because tokens are sensitive
-  ipcMain.handle("vercel:save-token", handleSaveVercelToken);
+  createTypedHandler(vercelContracts.saveToken, async (event, params) => {
+    await handleSaveVercelToken(event, params);
+  });
 
-  // Logged handlers
-  handle("vercel:list-projects", handleListVercelProjects);
-  handle("vercel:is-project-available", handleIsProjectAvailable);
-  handle("vercel:create-project", handleCreateProject);
-  handle("vercel:connect-existing-project", handleConnectToExistingProject);
-  handle("vercel:get-deployments", handleGetVercelDeployments);
-  handle("vercel:disconnect", handleDisconnectVercelProject);
+  createTypedHandler(vercelContracts.listProjects, async () => {
+    return handleListVercelProjects();
+  });
+
+  createTypedHandler(
+    vercelContracts.isProjectAvailable,
+    async (event, params) => {
+      return handleIsProjectAvailable(event, params);
+    },
+  );
+
+  createTypedHandler(vercelContracts.createProject, async (event, params) => {
+    return handleCreateProject(event, params);
+  });
+
+  createTypedHandler(
+    vercelContracts.connectExistingProject,
+    async (event, params) => {
+      await handleConnectToExistingProject(event, params);
+    },
+  );
+
+  createTypedHandler(vercelContracts.getDeployments, async (event, params) => {
+    return handleGetVercelDeployments(event, params);
+  });
+
+  createTypedHandler(
+    vercelContracts.createDeployment,
+    async (event, params) => {
+      return handleCreateVercelDeployment(event, params);
+    },
+  );
+
+  createTypedHandler(vercelContracts.disconnect, async (event, params) => {
+    await handleDisconnectVercelProject(event, params);
+  });
+
+  // DO NOT LOG these handlers — they resolve sensitive env var values.
+  createTypedHandler(vercelContracts.getSyncPreview, async (_, { appId }) => {
+    return previewNeonVercelSync({ appId });
+  });
+
+  createTypedHandler(
+    vercelContracts.syncNeonConfig,
+    async (_, { appId, branchType }) => {
+      return syncNeonConfigToVercel({ appId, branchType });
+    },
+  );
+
+  createTypedHandler(
+    vercelContracts.removeNeonEnvVars,
+    async (_, { appId }) => {
+      return removeNeonEnvVarsFromVercel({ appId });
+    },
+  );
+
+  logger.debug("Registered Vercel IPC handlers");
 }
 
 export async function updateAppVercelProject({
@@ -495,7 +701,7 @@ export async function updateAppVercelProject({
   appId: number;
   projectId: string;
   projectName: string;
-  teamId: string;
+  teamId: string | null;
   deploymentUrl?: string | null;
 }): Promise<void> {
   await db

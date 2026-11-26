@@ -12,6 +12,8 @@ dist/
 # playwright
 playwright-report/
 test-results/
+blob-report/
+flakiness-report/
 
 # Diagnostic reports (https://nodejs.org/api/report.html)
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
@@ -40,7 +42,10 @@ coverage
 build/Release
 
 # Dependency directories
-node_modules/
+# No trailing slash: a worktree may symlink node_modules at a shared install,
+# and `node_modules/` matches only real directories, so the symlink itself
+# stays visible to `git add -A`.
+node_modules
 jspm_packages/
 
 # TypeScript v1 declaration files
@@ -101,3 +106,19 @@ out/
 sqlite.db
 userData/
 .env.local
+.idea/
+
+# Claude Code
+.claude/settings.local.json
+.claude/tmp/
+
+# Python
+__pycache__/
+
+# Storybook
+storybook-static/
+
+# Eval framework — run results
+eval-results/
+benchmark-results/
+benchmarks/code-explorer/repos/

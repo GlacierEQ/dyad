@@ -1,13 +1,19 @@
-import { useState, useEffect, useCallback } from "react";
-import { useAtom } from "jotai";
-import { userSettingsAtom, envVarsAtom } from "@/atoms/appAtoms";
-import { IpcClient } from "@/ipc/ipc_client";
-import { type UserSettings } from "@/lib/schemas";
+import { useCallback, useEffect, useRef } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { ipc } from "@/ipc/types";
+import { type UserSettings, hasDyadProKey } from "@/lib/schemas";
+import {
+  getInitialLoadTelemetryProperties,
+  getSettingsPersonTelemetryProperties,
+} from "@/lib/posthogTelemetry";
 import { usePostHog } from "posthog-js/react";
 import { useAppVersion } from "./useAppVersion";
+import { queryKeys } from "@/lib/queryKeys";
+import { useSubscriptionAccount } from "./useSubscriptionAccount";
 
 const TELEMETRY_CONSENT_KEY = "dyadTelemetryConsent";
 const TELEMETRY_USER_ID_KEY = "dyadTelemetryUserId";
+const DYAD_PRO_STATUS_KEY = "dyadProStatus";
 
 export function isTelemetryOptedIn() {
   return window.localStorage.getItem(TELEMETRY_CONSENT_KEY) === "opted_in";
@@ -17,77 +23,151 @@ export function getTelemetryUserId(): string | null {
   return window.localStorage.getItem(TELEMETRY_USER_ID_KEY);
 }
 
-let isInitialLoad = false;
+export function isDyadProUser(): boolean {
+  return window.localStorage.getItem(DYAD_PRO_STATUS_KEY) === "true";
+}
+
+let initialLoadTelemetryState: "idle" | "sent" = "idle";
 
 export function useSettings() {
   const posthog = usePostHog();
-  const [settings, setSettingsAtom] = useAtom(userSettingsAtom);
-  const [envVars, setEnvVarsAtom] = useAtom(envVarsAtom);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<Error | null>(null);
   const appVersion = useAppVersion();
-  const loadInitialData = useCallback(async () => {
-    setLoading(true);
-    try {
-      const ipcClient = IpcClient.getInstance();
-      // Fetch settings and env vars concurrently
-      const [userSettings, fetchedEnvVars] = await Promise.all([
-        ipcClient.getUserSettings(),
-        ipcClient.getEnvVars(),
-      ]);
-      processSettingsForTelemetry(userSettings);
-      if (!isInitialLoad && appVersion) {
-        posthog.capture("app:initial-load", {
-          isPro: Boolean(userSettings.providerSettings?.auto?.apiKey?.value),
-          appVersion,
-        });
-        isInitialLoad = true;
-      }
-      setSettingsAtom(userSettings);
-      setEnvVarsAtom(fetchedEnvVars);
-      setError(null);
-    } catch (error) {
-      console.error("Error loading initial data:", error);
-      setError(error instanceof Error ? error : new Error(String(error)));
-    } finally {
-      setLoading(false);
-    }
-  }, [setSettingsAtom, setEnvVarsAtom, appVersion]);
+  const queryClient = useQueryClient();
+  const subscriptionQuery = useSubscriptionAccount();
+
+  const settingsQuery = useQuery({
+    queryKey: queryKeys.settings.user,
+    queryFn: () => ipc.settings.getUserSettings(),
+  });
+
+  const envVarsQuery = useQuery({
+    queryKey: queryKeys.settings.envVars,
+    queryFn: () => ipc.misc.getEnvVars(),
+  });
+
+  const {
+    data: platform,
+    error: platformError,
+    isLoading: isPlatformLoading,
+  } = useQuery({
+    queryKey: queryKeys.system.platform,
+    queryFn: () => ipc.system.getSystemPlatform(),
+    staleTime: Infinity,
+  });
+
+  const {
+    data: initialLoadTelemetryContext,
+    isLoading: isInitialLoadTelemetryContextLoading,
+  } = useQuery({
+    queryKey: queryKeys.system.initialLoadTelemetryContext,
+    queryFn: () => ipc.system.getInitialLoadTelemetryContext(),
+    staleTime: Infinity,
+  });
 
   useEffect(() => {
-    // Only run once on mount, dependencies are stable getters/setters
-    loadInitialData();
-  }, [loadInitialData]);
-
-  const updateSettings = async (newSettings: Partial<UserSettings>) => {
-    setLoading(true);
-    try {
-      const ipcClient = IpcClient.getInstance();
-      const updatedSettings = await ipcClient.setUserSettings(newSettings);
-      setSettingsAtom(updatedSettings);
-      processSettingsForTelemetry(updatedSettings);
-
-      setError(null);
-      return updatedSettings;
-    } catch (error) {
-      console.error("Error updating settings:", error);
-      setError(error instanceof Error ? error : new Error(String(error)));
-      throw error;
-    } finally {
-      setLoading(false);
+    if (!settingsQuery.data) {
+      return;
     }
-  };
+
+    processSettingsForTelemetry(settingsQuery.data);
+    posthog?.people?.set(
+      getSettingsPersonTelemetryProperties(settingsQuery.data),
+    );
+
+    if (
+      initialLoadTelemetryState !== "idle" ||
+      !appVersion ||
+      !posthog ||
+      isPlatformLoading ||
+      isInitialLoadTelemetryContextLoading ||
+      !initialLoadTelemetryContext ||
+      subscriptionQuery.isPending
+    ) {
+      return;
+    }
+
+    if (platformError) {
+      console.warn(
+        "Failed to get system platform for telemetry",
+        platformError,
+      );
+    }
+
+    posthog.capture(
+      "app:initial-load",
+      getInitialLoadTelemetryProperties({
+        settings: settingsQuery.data,
+        codexSubscriptionEnabled: subscriptionQuery.data?.connected ?? null,
+        appVersion,
+        platform: platform ?? null,
+        isFirstSession: initialLoadTelemetryContext.isFirstSession,
+        previousSessionAppSize:
+          initialLoadTelemetryContext.previousSessionAppSize,
+        pagefile: initialLoadTelemetryContext.pagefile,
+      }),
+    );
+    initialLoadTelemetryState = "sent";
+  }, [
+    settingsQuery.data,
+    appVersion,
+    posthog,
+    isPlatformLoading,
+    isInitialLoadTelemetryContextLoading,
+    platform,
+    platformError,
+    initialLoadTelemetryContext,
+    subscriptionQuery.isPending,
+    subscriptionQuery.data?.connected,
+  ]);
+
+  const updateSettingsMutation = useMutation({
+    mutationFn: async (newSettings: Partial<UserSettings>) => {
+      return ipc.settings.setUserSettings(newSettings);
+    },
+    onSuccess: (updatedSettings) => {
+      queryClient.setQueryData(queryKeys.settings.user, updatedSettings);
+      processSettingsForTelemetry(updatedSettings);
+      posthog?.people?.set(
+        getSettingsPersonTelemetryProperties(updatedSettings),
+      );
+    },
+    meta: { showErrorToast: true },
+  });
+  const updateSettingsMutationRef = useRef(updateSettingsMutation);
+  updateSettingsMutationRef.current = updateSettingsMutation;
+
+  const updateSettings = useCallback(
+    async (newSettings: Partial<UserSettings>) => {
+      return updateSettingsMutationRef.current.mutateAsync(newSettings);
+    },
+    [],
+  );
+
+  const refreshSettings = useCallback(async () => {
+    await queryClient.invalidateQueries({
+      queryKey: queryKeys.settings.all,
+    });
+    return (
+      queryClient.getQueryData<UserSettings>(queryKeys.settings.user) ?? null
+    );
+  }, [queryClient]);
+
+  const loading = settingsQuery.isLoading || envVarsQuery.isLoading;
+  const error = settingsQuery.error || envVarsQuery.error || null;
 
   return {
-    settings,
-    envVars,
+    settings: settingsQuery.data ?? null,
+    envVars: envVarsQuery.data ?? {},
     loading,
+    /**
+     * Just the user settings, without the env-vars query `loading` also
+     * covers. A caller that only reads a settings flag should not be held
+     * up by an unrelated request.
+     */
+    settingsLoading: settingsQuery.isLoading,
     error,
     updateSettings,
-
-    refreshSettings: () => {
-      return loadInitialData();
-    },
+    refreshSettings,
   };
 }
 
@@ -108,4 +188,8 @@ function processSettingsForTelemetry(settings: UserSettings) {
   } else {
     window.localStorage.removeItem(TELEMETRY_USER_ID_KEY);
   }
+  window.localStorage.setItem(
+    DYAD_PRO_STATUS_KEY,
+    hasDyadProKey(settings) ? "true" : "false",
+  );
 }

@@ -1,14 +1,101 @@
-import React, { useState, useRef } from "react";
-import type { FileAttachment } from "@/ipc/ipc_types";
+import React, { useCallback, useMemo, useRef, useState } from "react";
+import type { FileAttachment } from "@/ipc/types";
+import { atom, useAtom } from "jotai";
+import { attachmentsAtom, chatAttachmentsByIdAtom } from "@/atoms/chatAtoms";
+import { showError } from "@/lib/toast";
+import { validateChatAttachmentFiles } from "@/shared/chatAttachmentLimits";
 
-export function useAttachments() {
-  const [attachments, setAttachments] = useState<FileAttachment[]>([]);
+/**
+ * Is this drag carrying files, rather than something dragged within the page?
+ *
+ * `dataTransfer.files` is empty until the drop, so a dragover can only be told
+ * apart by its advertised types.
+ */
+function isFileDrag(e: React.DragEvent): boolean {
+  const types = e.dataTransfer?.types;
+  return types ? Array.from(types).includes("Files") : false;
+}
+
+const EMPTY_ATTACHMENTS: FileAttachment[] = [];
+
+export function useAttachments(chatId?: number | null) {
+  // Capture the rendered chat in the atom, so callbacks retained by an in-flight
+  // submission still write to that chat after navigation or unmount.
+  const draftAtom = useMemo(
+    () =>
+      chatId == null
+        ? attachmentsAtom
+        : atom(
+            (get) =>
+              get(chatAttachmentsByIdAtom).get(chatId) ?? EMPTY_ATTACHMENTS,
+            (
+              get,
+              set,
+              update:
+                | FileAttachment[]
+                | ((current: FileAttachment[]) => FileAttachment[]),
+            ) => {
+              const drafts = get(chatAttachmentsByIdAtom);
+              const current = drafts.get(chatId) ?? EMPTY_ATTACHMENTS;
+              const next =
+                typeof update === "function" ? update(current) : update;
+              if (next === current) return;
+              const updated = new Map(drafts);
+              if (next.length) updated.set(chatId, next);
+              else updated.delete(chatId);
+              set(chatAttachmentsByIdAtom, updated);
+            },
+          ),
+    [chatId],
+  );
+  const [attachments, setAttachments] = useAtom(draftAtom);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
+  const [pendingFiles, setPendingFiles] = useState<File[] | null>(null);
 
   const handleAttachmentClick = () => {
     fileInputRef.current?.click();
   };
+
+  const validateFiles = useCallback(
+    (
+      files: readonly File[],
+      existingAttachments: readonly FileAttachment[],
+    ): boolean => {
+      const validation = validateChatAttachmentFiles([
+        ...existingAttachments.map(({ file }) => file),
+        ...files,
+      ]);
+      if (!validation.ok) {
+        showError(validation.message);
+        return false;
+      }
+      return true;
+    },
+    [],
+  );
+
+  const addAttachments = useCallback(
+    (
+      files: File[],
+      type: "chat-context" | "upload-to-codebase" = "chat-context",
+    ): boolean => {
+      const fileAttachments: FileAttachment[] = files.map((file) => ({
+        file,
+        type,
+      }));
+      let didAdd = false;
+      setAttachments((current) => {
+        if (!validateFiles(files, current)) {
+          return current;
+        }
+        didAdd = true;
+        return [...current, ...fileAttachments];
+      });
+      return didAdd;
+    },
+    [setAttachments, validateFiles],
+  );
 
   const handleFileChange = (
     e: React.ChangeEvent<HTMLInputElement>,
@@ -16,11 +103,7 @@ export function useAttachments() {
   ) => {
     if (e.target.files && e.target.files.length > 0) {
       const files = Array.from(e.target.files);
-      const fileAttachments: FileAttachment[] = files.map((file) => ({
-        file,
-        type,
-      }));
-      setAttachments((attachments) => [...attachments, ...fileAttachments]);
+      addAttachments(files, type);
       // Clear the input value so the same file can be selected again
       e.target.value = "";
     }
@@ -31,11 +114,7 @@ export function useAttachments() {
     type: "chat-context" | "upload-to-codebase",
   ) => {
     const files = Array.from(fileList);
-    const fileAttachments: FileAttachment[] = files.map((file) => ({
-      file,
-      type,
-    }));
-    setAttachments((attachments) => [...attachments, ...fileAttachments]);
+    addAttachments(files, type);
   };
 
   const removeAttachment = (index: number) => {
@@ -44,7 +123,15 @@ export function useAttachments() {
 
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
-    setIsDraggingOver(true);
+    // Only a file drag arms the overlay. The composer also hosts draggable rows
+    // of its own — reordering a recorded test's checks — and their `dragover`
+    // bubbles up here; without this guard the whole composer would paint "Drop
+    // files to attach" over the very rows being dragged between, flickering as
+    // each child boundary fires `dragleave`.
+    if (!isFileDrag(e)) return;
+    if (!pendingFiles) {
+      setIsDraggingOver(true);
+    }
   };
 
   const handleDragLeave = () => {
@@ -55,32 +142,86 @@ export function useAttachments() {
     e.preventDefault();
     setIsDraggingOver(false);
 
+    if (pendingFiles) return;
+
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
       const files = Array.from(e.dataTransfer.files);
-      const fileAttachments: FileAttachment[] = files.map((file) => ({
-        file,
-        type: "chat-context" as const,
-      }));
-      setAttachments((attachments) => [...attachments, ...fileAttachments]);
+      if (validateFiles(files, attachments)) {
+        setPendingFiles(files);
+      }
     }
   };
 
+  const confirmPendingFiles = useCallback(
+    (type: "chat-context" | "upload-to-codebase") => {
+      if (pendingFiles && addAttachments(pendingFiles, type)) {
+        setPendingFiles(null);
+      }
+    },
+    [pendingFiles, addAttachments],
+  );
+
+  const cancelPendingFiles = useCallback(() => {
+    setPendingFiles(null);
+  }, []);
+
   const clearAttachments = () => {
     setAttachments([]);
+    setPendingFiles(null);
   };
 
-  const addAttachments = (
-    files: File[],
-    type: "chat-context" | "upload-to-codebase" = "chat-context",
-  ) => {
-    const fileAttachments: FileAttachment[] = files.map((file) => ({
-      file,
-      type,
-    }));
-    setAttachments((attachments) => [...attachments, ...fileAttachments]);
+  const clearSubmittedAttachments = useCallback(
+    (submittedAttachments: readonly FileAttachment[]) => {
+      setAttachments((current) => {
+        const remaining = [...current];
+        for (const submitted of submittedAttachments) {
+          const index = remaining.findIndex(
+            (candidate) =>
+              candidate.file === submitted.file &&
+              candidate.type === submitted.type,
+          );
+          if (index !== -1) remaining.splice(index, 1);
+        }
+        return remaining.length === current.length ? current : remaining;
+      });
+    },
+    [setAttachments],
+  );
+
+  const replaceAttachments = (newAttachments: FileAttachment[]) => {
+    const validation = validateChatAttachmentFiles(
+      newAttachments.map(({ file }) => file),
+    );
+    if (!validation.ok) {
+      showError(validation.message);
+      setAttachments([]);
+      setPendingFiles(null);
+      return false;
+    }
+    setAttachments(newAttachments);
+    setPendingFiles(null);
+    return true;
   };
+
+  const restoreSubmittedAttachments = useCallback(
+    (submitted: readonly FileAttachment[]) => {
+      setAttachments((current) => [
+        ...submitted.filter(
+          (entry) =>
+            !current.some(
+              (candidate) =>
+                candidate.file === entry.file && candidate.type === entry.type,
+            ),
+        ),
+        ...current,
+      ]);
+    },
+    [setAttachments],
+  );
 
   const handlePaste = async (e: React.ClipboardEvent) => {
+    if (pendingFiles) return;
+
     const clipboardData = e.clipboardData;
     if (!clipboardData) return;
 
@@ -112,10 +253,8 @@ export function useAttachments() {
         }
       }
 
-      if (imageFiles.length > 0) {
-        addAttachments(imageFiles, "chat-context");
-        // Show a brief toast or indication that image was pasted
-        console.log(`Pasted ${imageFiles.length} image(s) from clipboard`);
+      if (imageFiles.length > 0 && validateFiles(imageFiles, attachments)) {
+        setPendingFiles(imageFiles);
       }
     }
   };
@@ -124,6 +263,7 @@ export function useAttachments() {
     attachments,
     fileInputRef,
     isDraggingOver,
+    pendingFiles,
     handleAttachmentClick,
     handleFileChange,
     handleFileSelect,
@@ -132,6 +272,12 @@ export function useAttachments() {
     handleDragLeave,
     handleDrop,
     clearAttachments,
+    clearSubmittedAttachments,
+    restoreSubmittedAttachments,
     handlePaste,
+    addAttachments,
+    replaceAttachments,
+    confirmPendingFiles,
+    cancelPendingFiles,
   };
 }

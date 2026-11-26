@@ -2,14 +2,16 @@ import { expect } from "@playwright/test";
 import { test } from "./helpers/test_helper";
 
 test("auto update - disable and enable", async ({ po }) => {
-  await po.goToSettingsTab();
+  await po.navigation.goToSettingsTab();
 
-  await po.toggleAutoUpdate();
+  const beforeSettings = po.settings.recordSettings();
+  await po.settings.toggleAutoUpdate();
   await expect(
     po.page.getByRole("button", { name: "Restart Dyad" }),
   ).toBeVisible();
-  await po.snapshotSettings();
+  po.settings.snapshotSettingsDelta(beforeSettings);
 
-  await po.toggleAutoUpdate();
-  await po.snapshotSettings();
+  const beforeSettings2 = po.settings.recordSettings();
+  await po.settings.toggleAutoUpdate();
+  po.settings.snapshotSettingsDelta(beforeSettings2);
 });

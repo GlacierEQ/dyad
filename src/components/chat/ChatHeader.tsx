@@ -4,8 +4,10 @@ import {
   PlusCircle,
   GitBranch,
   Info,
+  SquareTerminal,
 } from "lucide-react";
 import { PanelRightClose } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { useAtom, useAtomValue } from "jotai";
 import { selectedAppIdAtom } from "@/atoms/appAtoms";
 import { useVersions } from "@/hooks/useVersions";
@@ -16,18 +18,22 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "../ui/tooltip";
-import { IpcClient } from "@/ipc/ipc_client";
+import { ipc } from "@/ipc/types";
 import { useRouter } from "@tanstack/react-router";
 import { selectedChatIdAtom } from "@/atoms/chatAtoms";
+import { useSelectChat } from "@/hooks/useSelectChat";
 import { useChats } from "@/hooks/useChats";
 import { showError, showSuccess } from "@/lib/toast";
 import { useEffect } from "react";
 import { useStreamChat } from "@/hooks/useStreamChat";
 import { useCurrentBranch } from "@/hooks/useCurrentBranch";
-import { useCheckoutVersion } from "@/hooks/useCheckoutVersion";
+import { useVersionPreview } from "@/hooks/useVersionPreview";
+import { isMutatingState } from "@/version_preview/state";
 import { useRenameBranch } from "@/hooks/useRenameBranch";
-import { isAnyCheckoutVersionInProgressAtom } from "@/store/appAtoms";
 import { LoadingBar } from "../ui/LoadingBar";
+import { UncommittedFilesBanner } from "./UncommittedFilesBanner";
+import { terminalOpenByChatIdAtom } from "@/atoms/terminalAtoms";
+import { cn } from "@/lib/utils";
 
 interface ChatHeaderProps {
   isVersionPaneOpen: boolean;
@@ -42,23 +48,29 @@ export function ChatHeader({
   onTogglePreview,
   onVersionClick,
 }: ChatHeaderProps) {
+  const { t } = useTranslation("chat");
   const appId = useAtomValue(selectedAppIdAtom);
   const { versions, loading: versionsLoading } = useVersions(appId);
   const { navigate } = useRouter();
-  const [selectedChatId, setSelectedChatId] = useAtom(selectedChatIdAtom);
-  const { refreshChats } = useChats(appId);
-  const { isStreaming } = useStreamChat();
-  const isAnyCheckoutVersionInProgress = useAtomValue(
-    isAnyCheckoutVersionInProgressAtom,
+  const [selectedChatId] = useAtom(selectedChatIdAtom);
+  const [terminalOpenByChatId, setTerminalOpenByChatId] = useAtom(
+    terminalOpenByChatIdAtom,
   );
-
+  const { invalidateChats } = useChats(appId);
+  const { selectChat } = useSelectChat();
+  const { isStreaming } = useStreamChat();
   const {
     branchInfo,
     isLoading: branchInfoLoading,
     refetchBranchInfo,
   } = useCurrentBranch(appId);
 
-  const { checkoutVersion, isCheckingOutVersion } = useCheckoutVersion();
+  const {
+    state: versionPreviewState,
+    projection: versionPreviewProjection,
+    send: sendVersionPreviewEvent,
+  } = useVersionPreview(appId);
+  const isCheckingOutVersion = isMutatingState(versionPreviewState);
   const { renameBranch, isRenamingBranch } = useRenameBranch();
 
   useEffect(() => {
@@ -69,7 +81,7 @@ export function ChatHeader({
 
   const handleCheckoutMainBranch = async () => {
     if (!appId) return;
-    await checkoutVersion({ appId, versionId: "main" });
+    sendVersionPreviewEvent({ type: "SWITCH_BRANCH", appId, branch: "main" });
   };
 
   const handleRenameMasterToMain = async () => {
@@ -77,21 +89,17 @@ export function ChatHeader({
     // If this throws, it will automatically show an error toast
     await renameBranch({ oldBranchName: "master", newBranchName: "main" });
 
-    showSuccess("Master branch renamed to main");
+    showSuccess(t("header.masterRenamed"));
   };
 
   const handleNewChat = async () => {
     if (appId) {
       try {
-        const chatId = await IpcClient.getInstance().createChat(appId);
-        setSelectedChatId(chatId);
-        navigate({
-          to: "/chat",
-          search: { id: chatId },
-        });
-        await refreshChats();
+        const chatId = await ipc.chat.createChat({ appId });
+        await invalidateChats();
+        selectChat({ chatId, appId });
       } catch (error) {
-        showError(`Failed to create new chat: ${(error as any).toString()}`);
+        showError(t("failedCreateChat", { error: (error as any).toString() }));
       }
     } else {
       navigate({ to: "/" });
@@ -104,10 +112,25 @@ export function ChatHeader({
   const isNotMainBranch = branchInfo && branchInfo.branch !== "main";
 
   const currentBranchName = branchInfo?.branch;
+  const isTerminalOpen = selectedChatId
+    ? (terminalOpenByChatId.get(selectedChatId) ?? false)
+    : false;
+  const isTerminalDisabled = !appId || !selectedChatId;
+
+  const handleToggleTerminal = () => {
+    if (!appId || !selectedChatId) return;
+
+    const nextOpen = !isTerminalOpen;
+    setTerminalOpenByChatId((prev) => {
+      const next = new Map(prev);
+      next.set(selectedChatId, nextOpen);
+      return next;
+    });
+  };
 
   return (
     <div className="flex flex-col w-full @container">
-      <LoadingBar isVisible={isAnyCheckoutVersionInProgress} />
+      <LoadingBar isVisible={isCheckingOutVersion} />
       {/* If the version pane is open, it's expected to not always be on the main branch. */}
       {isNotMainBranch && !isVersionPaneOpen && (
         <div className="flex flex-col @sm:flex-row items-center justify-between px-4 py-2 bg-amber-100 dark:bg-amber-900 text-amber-800 dark:text-amber-200">
@@ -118,17 +141,28 @@ export function ChatHeader({
                 <>
                   <TooltipProvider>
                     <Tooltip>
-                      <TooltipTrigger asChild>
+                      <TooltipTrigger>
                         <span className="flex items-center  gap-1">
-                          <strong>Warning:</strong>
-                          <span>You are not on a branch</span>
-                          <Info size={14} />
+                          {isCheckingOutVersion ? (
+                            <>
+                              <span>{t("header.switchingToLatest")}</span>
+                            </>
+                          ) : (
+                            <>
+                              <strong>
+                                {t("header.warningNotOnBranch").split(":")[0]}:
+                              </strong>
+                              <span>{t("header.notOnBranch")}</span>
+                              <Info size={14} />
+                            </>
+                          )}
                         </span>
                       </TooltipTrigger>
                       <TooltipContent>
                         <p>
-                          Checkout main branch, otherwise changes will not be
-                          saved properly
+                          {isCheckingOutVersion
+                            ? t("header.checkoutInProgress")
+                            : t("header.checkoutMainBranch")}
                         </p>
                       </TooltipContent>
                     </Tooltip>
@@ -136,11 +170,9 @@ export function ChatHeader({
                 </>
               )}
               {currentBranchName && currentBranchName !== "<no-branch>" && (
-                <span>
-                  You are on branch: <strong>{currentBranchName}</strong>.
-                </span>
+                <span>{t("header.onBranch", { name: currentBranchName })}</span>
               )}
-              {branchInfoLoading && <span>Checking branch...</span>}
+              {branchInfoLoading && <span>{t("header.checkingBranch")}</span>}
             </span>
           </div>
           {currentBranchName === "master" ? (
@@ -150,21 +182,32 @@ export function ChatHeader({
               onClick={handleRenameMasterToMain}
               disabled={isRenamingBranch || branchInfoLoading}
             >
-              {isRenamingBranch ? "Renaming..." : "Rename master to main"}
+              {isRenamingBranch
+                ? t("header.renaming")
+                : t("header.renameMasterToMain")}
             </Button>
           ) : (
             <Button
               variant="outline"
               size="sm"
               onClick={handleCheckoutMainBranch}
-              disabled={isCheckingOutVersion || branchInfoLoading}
+              disabled={
+                !versionPreviewProjection.capabilities.canSwitchBranch ||
+                branchInfoLoading
+              }
             >
               {isCheckingOutVersion
-                ? "Checking out..."
-                : "Switch to main branch"}
+                ? t("header.checkingOut")
+                : t("header.switchToMainBranch")}
             </Button>
           )}
         </div>
+      )}
+
+      {/* Show uncommitted files banner when on a branch and there are uncommitted changes */}
+      {/* Hide while streaming to avoid distracting the user */}
+      {!isVersionPaneOpen && branchInfo?.branch && !isStreaming && (
+        <UncommittedFilesBanner appId={appId} />
       )}
 
       {/* Why is this pt-0.5? Because the loading bar is h-1 (it always takes space) and we want the vertical spacing to be consistent.*/}
@@ -174,9 +217,10 @@ export function ChatHeader({
             onClick={handleNewChat}
             variant="ghost"
             className="hidden @2xs:flex items-center justify-start gap-2 mx-2 py-3"
+            data-testid="new-chat-button"
           >
             <PlusCircle size={16} />
-            <span>New Chat</span>
+            <span>{t("newChat")}</span>
           </Button>
           <Button
             onClick={onVersionClick}
@@ -186,21 +230,50 @@ export function ChatHeader({
             <History size={16} />
             {versionsLoading
               ? "..."
-              : `Version ${versions.length}${versionPostfix}`}
+              : `${t("header.versionCount", { count: versions.length })}${versionPostfix}`}
           </Button>
         </div>
 
-        <button
-          data-testid="toggle-preview-panel-button"
-          onClick={onTogglePreview}
-          className="cursor-pointer p-2 hover:bg-(--background-lightest) rounded-md"
-        >
-          {isPreviewOpen ? (
-            <PanelRightClose size={20} />
-          ) : (
-            <PanelRightOpen size={20} />
-          )}
-        </button>
+        <div className="flex items-center gap-1">
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <button
+                    type="button"
+                    data-testid="toggle-terminal-button"
+                    onClick={handleToggleTerminal}
+                    disabled={isTerminalDisabled}
+                    aria-label={t("terminal.toggleAriaLabel")}
+                    aria-pressed={isTerminalOpen}
+                    className={cn(
+                      "cursor-pointer rounded-md p-2 hover:bg-(--background-lightest) disabled:cursor-not-allowed disabled:opacity-50",
+                      isTerminalOpen && "bg-primary/10 text-primary",
+                    )}
+                  />
+                }
+              >
+                <SquareTerminal size={20} />
+              </TooltipTrigger>
+              <TooltipContent>
+                {isTerminalDisabled
+                  ? t("terminal.toggleDisabledTooltip")
+                  : t("terminal.toggleTooltip")}
+              </TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+          <button
+            data-testid="toggle-preview-panel-button"
+            onClick={onTogglePreview}
+            className="cursor-pointer p-2 hover:bg-(--background-lightest) rounded-md"
+          >
+            {isPreviewOpen ? (
+              <PanelRightClose size={20} />
+            ) : (
+              <PanelRightOpen size={20} />
+            )}
+          </button>
+        </div>
       </div>
     </div>
   );

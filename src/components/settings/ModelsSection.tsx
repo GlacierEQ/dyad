@@ -1,9 +1,11 @@
 import { useState } from "react";
-import { AlertTriangle, PlusIcon, TrashIcon } from "lucide-react";
+import { AlertTriangle, PlusIcon, DownloadIcon, TrashIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { CreateCustomModelDialog } from "@/components/CreateCustomModelDialog";
+import { EditCustomModelDialog } from "@/components/EditCustomModelDialog";
+import { FetchModelsDialog } from "@/components/FetchModelsDialog";
 import { useLanguageModelsForProvider } from "@/hooks/useLanguageModelsForProvider"; // Use the hook directly here
 import { useDeleteCustomModel } from "@/hooks/useDeleteCustomModel"; // Import the new hook
 import {
@@ -16,6 +18,8 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { useQueryClient } from "@tanstack/react-query";
+import { queryKeys } from "@/lib/queryKeys";
 
 interface ModelsSectionProps {
   providerId: string;
@@ -23,22 +27,35 @@ interface ModelsSectionProps {
 
 export function ModelsSection({ providerId }: ModelsSectionProps) {
   const [isCustomModelDialogOpen, setIsCustomModelDialogOpen] = useState(false);
+  const [isEditModelDialogOpen, setIsEditModelDialogOpen] = useState(false);
+  const [isFetchModelsDialogOpen, setIsFetchModelsDialogOpen] = useState(false);
   const [isConfirmDeleteDialogOpen, setIsConfirmDeleteDialogOpen] =
     useState(false);
   const [modelToDelete, setModelToDelete] = useState<string | null>(null);
+  const [modelToEdit, setModelToEdit] = useState<any | null>(null);
+  const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  const queryClient = useQueryClient();
+
+  const invalidateModels = () => {
+    queryClient.invalidateQueries({
+      queryKey: queryKeys.languageModels.forProvider({ providerId }),
+    });
+    queryClient.invalidateQueries({
+      queryKey: queryKeys.languageModels.byProviders,
+    });
+  };
 
   // Fetch custom models within this component now
   const {
     data: models,
     isLoading: modelsLoading,
     error: modelsError,
-    refetch: refetchModels,
   } = useLanguageModelsForProvider(providerId);
 
   const { mutate: deleteModel, isPending: isDeleting } = useDeleteCustomModel({
     onSuccess: () => {
-      refetchModels(); // Refetch models list after successful deletion
       // Optionally show a success toast here
+      invalidateModels();
     },
     onError: (error: Error) => {
       // Optionally show an error toast here
@@ -49,6 +66,21 @@ export function ModelsSection({ providerId }: ModelsSectionProps) {
   const handleDeleteClick = (modelApiName: string) => {
     setModelToDelete(modelApiName);
     setIsConfirmDeleteDialogOpen(true);
+  };
+
+  const handleEditClick = (model: any) => {
+    setModelToEdit(model);
+    setIsEditModelDialogOpen(true);
+  };
+
+  const handleModelClick = (modelApiName: string) => {
+    setSelectedModel(selectedModel === modelApiName ? null : modelApiName);
+  };
+
+  const handleModelDoubleClick = (model: any) => {
+    if (model.type === "custom") {
+      handleEditClick(model);
+    }
   };
 
   const handleConfirmDelete = () => {
@@ -85,22 +117,56 @@ export function ModelsSection({ providerId }: ModelsSectionProps) {
           {models.map((model) => (
             <div
               key={model.apiName + model.displayName}
-              className="p-4 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-sm"
+              className={`p-4 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-sm cursor-pointer hover:shadow-md transition-shadow ${
+                selectedModel === model.apiName
+                  ? "ring-2 ring-blue-500 dark:ring-blue-400"
+                  : ""
+              }`}
+              onClick={() => handleModelClick(model.apiName)}
+              onDoubleClick={() => handleModelDoubleClick(model)}
             >
               <div className="flex justify-between items-center">
                 <h4 className="text-lg font-semibold text-gray-800 dark:text-gray-100">
                   {model.displayName}
                 </h4>
                 {model.type === "custom" && (
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    onClick={() => handleDeleteClick(model.apiName)}
-                    disabled={isDeleting}
-                    className="text-red-500 hover:text-red-700 hover:bg-red-100 dark:hover:bg-red-900/50 h-8 w-8"
-                  >
-                    <TrashIcon className="h-4 w-4" />
-                  </Button>
+                  <div className="flex gap-2">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleEditClick(model);
+                      }}
+                      className="text-blue-500 hover:text-blue-700 hover:bg-blue-100 dark:hover:bg-blue-900/50 h-8 w-8"
+                    >
+                      <svg
+                        className="h-4 w-4"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"
+                        />
+                      </svg>
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleDeleteClick(model.apiName);
+                      }}
+                      disabled={isDeleting}
+                      className="text-red-500 hover:text-red-700 hover:bg-red-100 dark:hover:bg-red-900/50 h-8 w-8"
+                    >
+                      <TrashIcon className="h-4 w-4" />
+                    </Button>
+                  </div>
                 )}
               </div>
               <p className="text-sm text-gray-500 dark:text-gray-400 italic">
@@ -146,24 +212,53 @@ export function ModelsSection({ providerId }: ModelsSectionProps) {
       {/* End Custom Models List Area */}
 
       {providerId !== "auto" && (
-        <Button
-          onClick={() => setIsCustomModelDialogOpen(true)}
-          variant="outline"
-          className="mt-6"
-        >
-          <PlusIcon className="mr-2 h-4 w-4" /> Add Custom Model
-        </Button>
+        <div className="mt-6 flex gap-2">
+          {providerId.startsWith("custom::") && (
+            <Button
+              onClick={() => setIsFetchModelsDialogOpen(true)}
+              // The import handler rechecks duplicates when the saved list is unavailable.
+              disabled={modelsLoading}
+              variant="outline"
+            >
+              <DownloadIcon className="mr-2 h-4 w-4" /> Import Models
+            </Button>
+          )}
+          <Button
+            onClick={() => setIsCustomModelDialogOpen(true)}
+            variant="outline"
+          >
+            <PlusIcon className="mr-2 h-4 w-4" /> Add Custom Model
+          </Button>
+        </div>
       )}
 
-      {/* Render the dialog */}
+      {/* Render the dialogs */}
+      <FetchModelsDialog
+        isOpen={isFetchModelsDialogOpen}
+        onClose={() => setIsFetchModelsDialogOpen(false)}
+        providerId={providerId}
+        existingApiNames={(models ?? []).map((m) => m.apiName)}
+      />
       <CreateCustomModelDialog
         isOpen={isCustomModelDialogOpen}
         onClose={() => setIsCustomModelDialogOpen(false)}
         onSuccess={() => {
           setIsCustomModelDialogOpen(false);
-          refetchModels(); // Refetch models on success
+          invalidateModels();
         }}
         providerId={providerId}
+      />
+
+      <EditCustomModelDialog
+        isOpen={isEditModelDialogOpen}
+        onClose={() => setIsEditModelDialogOpen(false)}
+        onSuccess={() => {
+          setIsEditModelDialogOpen(false);
+          invalidateModels();
+        }}
+        providerId={providerId}
+        model={modelToEdit}
+        models={models}
       />
 
       <AlertDialog

@@ -1,26 +1,30 @@
 import path from "path";
 import fs from "fs-extra";
-import git from "isomorphic-git";
-import http from "isomorphic-git/http/node";
 import { app } from "electron";
 import { copyDirectoryRecursive } from "../utils/file_utils";
+import { gitClone, getCurrentCommitHash } from "../utils/git_utils";
 import { readSettings } from "@/main/settings";
 import { getTemplateOrThrow } from "../utils/template_utils";
 import log from "electron-log";
+import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
 
 const logger = log.scope("createFromTemplate");
 
 export async function createFromTemplate({
   fullAppPath,
+  templateId: requestedTemplateId,
 }: {
   fullAppPath: string;
+  templateId?: string;
 }) {
   const settings = readSettings();
-  const templateId = settings.selectedTemplateId;
+  const templateId = requestedTemplateId ?? settings.selectedTemplateId;
 
   if (templateId === "react") {
+    const sourceScaffoldPath = path.join(__dirname, "..", "..", "scaffold");
+    const repoScaffoldPath = path.join(process.cwd(), "scaffold");
     await copyDirectoryRecursive(
-      path.join(__dirname, "..", "..", "scaffold"),
+      fs.existsSync(sourceScaffoldPath) ? sourceScaffoldPath : repoScaffoldPath,
       fullAppPath,
     );
     return;
@@ -28,22 +32,28 @@ export async function createFromTemplate({
 
   const template = await getTemplateOrThrow(templateId);
   if (!template.githubUrl) {
-    throw new Error(`Template ${templateId} has no GitHub URL`);
+    throw new DyadError(
+      `Template ${templateId} has no GitHub URL`,
+      DyadErrorKind.External,
+    );
   }
   const repoCachePath = await cloneRepo(template.githubUrl);
   await copyRepoToApp(repoCachePath, fullAppPath);
 }
 
 async function cloneRepo(repoUrl: string): Promise<string> {
-  let orgName: string;
-  let repoName: string;
-
   const url = new URL(repoUrl);
   if (url.protocol !== "https:") {
-    throw new Error("Repository URL must use HTTPS.");
+    throw new DyadError(
+      "Repository URL must use HTTPS.",
+      DyadErrorKind.External,
+    );
   }
   if (url.hostname !== "github.com") {
-    throw new Error("Repository URL must be a github.com URL.");
+    throw new DyadError(
+      "Repository URL must be a github.com URL.",
+      DyadErrorKind.Validation,
+    );
   }
 
   // Pathname will be like "/org/repo" or "/org/repo.git"
@@ -55,8 +65,8 @@ async function cloneRepo(repoUrl: string): Promise<string> {
     );
   }
 
-  orgName = pathParts[0];
-  repoName = path.basename(pathParts[1], ".git"); // Remove .git suffix if present
+  const orgName = pathParts[0];
+  const repoName = path.basename(pathParts[1], ".git"); // Remove .git suffix if present
 
   if (!orgName || !repoName) {
     // This case should ideally be caught by pathParts.length !== 2
@@ -83,41 +93,34 @@ async function cloneRepo(repoUrl: string): Promise<string> {
       const apiUrl = `https://api.github.com/repos/${orgName}/${repoName}/commits/HEAD`;
       logger.info(`Fetching remote SHA from ${apiUrl}`);
 
-      let remoteSha: string | undefined;
-
-      const response = await http.request({
-        url: apiUrl,
+      // Use native fetch for the template archive.
+      const response = await fetch(apiUrl, {
         method: "GET",
         headers: {
-          "User-Agent": "Dyad", // GitHub API requires a User-Agent
+          "User-Agent": "Dyad", // GitHub API requires this
           Accept: "application/vnd.github.v3+json",
         },
       });
-
-      if (response.statusCode === 200 && response.body) {
-        // Convert AsyncIterableIterator<Uint8Array> to string
-        const chunks: Uint8Array[] = [];
-        for await (const chunk of response.body) {
-          chunks.push(chunk);
-        }
-        const responseBodyStr = Buffer.concat(chunks).toString("utf8");
-        const commitData = JSON.parse(responseBodyStr);
-        remoteSha = commitData.sha;
-        if (!remoteSha) {
-          throw new Error("SHA not found in GitHub API response.");
-        }
-        logger.info(`Successfully fetched remote SHA: ${remoteSha}`);
-      } else {
+      // Handle non-200 responses
+      if (!response.ok) {
         throw new Error(
-          `GitHub API request failed with status ${response.statusCode}: ${response.statusMessage}`,
+          `GitHub API request failed with status ${response.status}: ${response.statusText}`,
+        );
+      }
+      // Parse JSON directly (fetch handles streaming internally)
+      const commitData = await response.json();
+      const remoteSha = commitData.sha;
+      if (!remoteSha) {
+        throw new DyadError(
+          "SHA not found in GitHub API response.",
+          DyadErrorKind.NotFound,
         );
       }
 
-      const localSha = await git.resolveRef({
-        fs,
-        dir: cachePath,
-        ref: "HEAD",
-      });
+      logger.info(`Successfully fetched remote SHA: ${remoteSha}`);
+
+      // Compare with local SHA
+      const localSha = await getCurrentCommitHash({ path: cachePath });
 
       if (remoteSha === localSha) {
         logger.info(
@@ -129,7 +132,7 @@ async function cloneRepo(repoUrl: string): Promise<string> {
           `Local cache for ${repoName} (SHA: ${localSha}) is outdated (Remote SHA: ${remoteSha}). Removing and re-cloning.`,
         );
         fs.rmSync(cachePath, { recursive: true, force: true });
-        // Proceed to clone
+        // Continue to clone…
       }
     } catch (err) {
       logger.warn(
@@ -144,14 +147,7 @@ async function cloneRepo(repoUrl: string): Promise<string> {
 
   logger.info(`Cloning ${repoUrl} to ${cachePath}`);
   try {
-    await git.clone({
-      fs,
-      http,
-      dir: cachePath,
-      url: repoUrl,
-      singleBranch: true,
-      depth: 1,
-    });
+    await gitClone({ path: cachePath, url: repoUrl, depth: 1 });
     logger.info(`Successfully cloned ${repoUrl} to ${cachePath}`);
   } catch (err) {
     logger.error(`Failed to clone ${repoUrl} to ${cachePath}: `, err);

@@ -1,43 +1,31 @@
 import { useCallback } from "react";
-import { useAtom } from "jotai";
-import {
-  lmStudioModelsAtom,
-  lmStudioModelsLoadingAtom,
-  lmStudioModelsErrorAtom,
-} from "@/atoms/localModelsAtoms";
-import { IpcClient } from "@/ipc/ipc_client";
+import { useQuery } from "@tanstack/react-query";
+import { ipc, type LocalModel } from "@/ipc/types";
+import { queryKeys } from "@/lib/queryKeys";
 
 export function useLocalLMSModels() {
-  const [models, setModels] = useAtom(lmStudioModelsAtom);
-  const [loading, setLoading] = useAtom(lmStudioModelsLoadingAtom);
-  const [error, setError] = useAtom(lmStudioModelsErrorAtom);
+  const { data, isFetching, error, refetch } = useQuery<LocalModel[], Error>({
+    queryKey: queryKeys.languageModels.lmStudioLocal,
+    queryFn: async () => {
+      const { models } = await ipc.languageModel.listLMStudioModels();
+      return models;
+    },
+    enabled: false,
+  });
 
-  const ipcClient = IpcClient.getInstance();
-
-  /**
-   * Load local models from Ollama
-   */
   const loadModels = useCallback(async () => {
-    setLoading(true);
-    try {
-      const modelList = await ipcClient.listLocalLMStudioModels();
-      setModels(modelList);
-      setError(null);
-
-      return modelList;
-    } catch (error) {
-      console.error("Error loading local LMStudio models:", error);
-      setError(error instanceof Error ? error : new Error(String(error)));
+    const result = await refetch();
+    if (result.error) {
+      console.error("Error loading local LMStudio models:", result.error);
       return [];
-    } finally {
-      setLoading(false);
     }
-  }, [ipcClient, setModels, setError, setLoading]);
+    return result.data ?? [];
+  }, [refetch]);
 
   return {
-    models,
-    loading,
-    error,
+    models: data ?? [],
+    loading: isFetching,
+    error: error ?? null,
     loadModels,
   };
 }

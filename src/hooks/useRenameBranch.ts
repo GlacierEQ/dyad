@@ -1,8 +1,10 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { IpcClient } from "@/ipc/ipc_client";
+import { ipc } from "@/ipc/types";
 import { showError } from "@/lib/toast";
 import { selectedAppIdAtom } from "@/atoms/appAtoms";
 import { useAtomValue } from "jotai";
+import { queryKeys } from "@/lib/queryKeys";
+import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
 
 interface RenameBranchParams {
   appId: number;
@@ -17,23 +19,32 @@ export function useRenameBranch() {
   const mutation = useMutation<void, Error, RenameBranchParams>({
     mutationFn: async (params: RenameBranchParams) => {
       if (params.appId === null || params.appId === undefined) {
-        throw new Error("App ID is required to rename a branch.");
+        throw new DyadError(
+          "App ID is required to rename a branch.",
+          DyadErrorKind.Validation,
+        );
       }
       if (!params.oldBranchName) {
-        throw new Error("Old branch name is required.");
+        throw new DyadError(
+          "Old branch name is required.",
+          DyadErrorKind.Validation,
+        );
       }
       if (!params.newBranchName) {
-        throw new Error("New branch name is required.");
+        throw new DyadError(
+          "New branch name is required.",
+          DyadErrorKind.Validation,
+        );
       }
-      await IpcClient.getInstance().renameBranch(params);
+      await ipc.app.renameBranch(params);
     },
     onSuccess: (_, variables) => {
       // Invalidate queries that depend on branch information
       queryClient.invalidateQueries({
-        queryKey: ["currentBranch", variables.appId],
+        queryKey: queryKeys.branches.byApp({ appId: variables.appId }),
       });
       queryClient.invalidateQueries({
-        queryKey: ["versions", variables.appId],
+        queryKey: queryKeys.versions.list({ appId: variables.appId }),
       });
       // Potentially show a success message or trigger other actions
     },

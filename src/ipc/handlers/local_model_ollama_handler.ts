@@ -1,6 +1,8 @@
-import { ipcMain } from "electron";
 import log from "electron-log";
-import { LocalModelListResponse, LocalModel } from "../ipc_types";
+import { createTypedHandler } from "./base";
+import { languageModelContracts } from "../types/language-model";
+import type { LocalModel } from "../types/language-model";
+import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
 
 const logger = log.scope("ollama_handler");
 
@@ -37,7 +39,9 @@ export function parseOllamaHost(host?: string): string {
   return `http://${host}:11434`;
 }
 
-const OLLAMA_API_URL = parseOllamaHost(process.env.OLLAMA_HOST);
+export function getOllamaApiUrl(): string {
+  return parseOllamaHost(process.env.OLLAMA_HOST);
+}
 
 interface OllamaModel {
   name: string;
@@ -53,11 +57,14 @@ interface OllamaModel {
   };
 }
 
-export async function fetchOllamaModels(): Promise<LocalModelListResponse> {
+export async function fetchOllamaModels(): Promise<{ models: LocalModel[] }> {
   try {
-    const response = await fetch(`${OLLAMA_API_URL}/api/tags`);
+    const response = await fetch(`${getOllamaApiUrl()}/api/tags`);
     if (!response.ok) {
-      throw new Error(`Failed to fetch model: ${response.statusText}`);
+      throw new DyadError(
+        `Failed to fetch model: ${response.statusText}`,
+        DyadErrorKind.External,
+      );
     }
 
     const data = await response.json();
@@ -82,23 +89,28 @@ export async function fetchOllamaModels(): Promise<LocalModelListResponse> {
     logger.info(`Successfully fetched ${models.length} models from Ollama`);
     return { models };
   } catch (error) {
+    if (error instanceof DyadError) {
+      throw error;
+    }
     if (
       error instanceof TypeError &&
       (error as Error).message.includes("fetch failed")
     ) {
-      throw new Error(
-        "Could not connect to Ollama. Make sure it's running at http://localhost:11434",
+      throw new DyadError(
+        "Could not connect to Ollama. Make sure it's running at " +
+          getOllamaApiUrl(),
+        DyadErrorKind.Precondition,
       );
     }
-    throw new Error("Failed to fetch models from Ollama");
+    throw new DyadError(
+      "Failed to fetch models from Ollama",
+      DyadErrorKind.External,
+    );
   }
 }
 
 export function registerOllamaHandlers() {
-  ipcMain.handle(
-    "local-models:list-ollama",
-    async (): Promise<LocalModelListResponse> => {
-      return fetchOllamaModels();
-    },
-  );
+  createTypedHandler(languageModelContracts.listOllamaModels, async () => {
+    return fetchOllamaModels();
+  });
 }

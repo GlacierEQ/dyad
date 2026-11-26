@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React from "react";
 import {
   Tooltip,
   TooltipContent,
@@ -6,11 +6,15 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useCountTokens } from "@/hooks/useCountTokens";
-import { MessageSquare, Code, Bot, AlignLeft } from "lucide-react";
+import {
+  MessageSquare,
+  Code,
+  Bot,
+  AlignLeft,
+  ExternalLink,
+} from "lucide-react";
 import { chatInputValueAtom } from "@/atoms/chatAtoms";
 import { useAtom } from "jotai";
-import { useSettings } from "@/hooks/useSettings";
-import { IpcClient } from "@/ipc/ipc_client";
 
 interface TokenBarProps {
   chatId?: number;
@@ -18,33 +22,17 @@ interface TokenBarProps {
 
 export function TokenBar({ chatId }: TokenBarProps) {
   const [inputValue] = useAtom(chatInputValueAtom);
-  const { countTokens, result } = useCountTokens();
-  const [error, setError] = useState<string | null>(null);
-  const { settings } = useSettings();
-  useEffect(() => {
-    if (!chatId) return;
-    // Mark this as used, we need to re-trigger token count
-    // when selected model changes.
-    void settings?.selectedModel;
-
-    const debounceTimer = setTimeout(() => {
-      countTokens(chatId, inputValue).catch((err) => {
-        setError("Failed to count tokens");
-        console.error("Token counting error:", err);
-      });
-    }, 500);
-
-    return () => clearTimeout(debounceTimer);
-  }, [chatId, inputValue, countTokens, settings?.selectedModel]);
+  const { result, error } = useCountTokens(chatId ?? null, inputValue);
 
   if (!chatId || !result) {
     return null;
   }
 
   const {
-    totalTokens,
+    estimatedTotalTokens: totalTokens,
     messageHistoryTokens,
     codebaseTokens,
+    mentionedAppsTokens,
     systemPromptTokens,
     inputTokens,
     contextWindow,
@@ -55,20 +43,21 @@ export function TokenBar({ chatId }: TokenBarProps) {
   // Calculate widths for each token type
   const messageHistoryPercent = (messageHistoryTokens / contextWindow) * 100;
   const codebasePercent = (codebaseTokens / contextWindow) * 100;
+  const mentionedAppsPercent = (mentionedAppsTokens / contextWindow) * 100;
   const systemPromptPercent = (systemPromptTokens / contextWindow) * 100;
   const inputPercent = (inputTokens / contextWindow) * 100;
 
   return (
-    <div className="px-4 pb-2 text-xs">
+    <div className="px-4 pb-2 text-xs" data-testid="token-bar">
       <TooltipProvider>
         <Tooltip>
-          <TooltipTrigger asChild>
+          <TooltipTrigger className="w-full">
             <div className="w-full">
-              <div className="flex justify-between mb-1 text-xs text-muted-foreground">
+              <div className="flex gap-3 mb-1 text-xs text-muted-foreground">
                 <span>Tokens: {totalTokens.toLocaleString()}</span>
+                <span>{Math.round(percentUsed)}%</span>
                 <span>
-                  {Math.round(percentUsed)}% of{" "}
-                  {(contextWindow / 1000).toFixed(0)}K
+                  Context window: {(contextWindow / 1000).toFixed(0)}K
                 </span>
               </div>
               <div className="w-full h-1.5 bg-muted rounded-full overflow-hidden flex">
@@ -81,6 +70,11 @@ export function TokenBar({ chatId }: TokenBarProps) {
                 <div
                   className="h-full bg-green-400"
                   style={{ width: `${codebasePercent}%` }}
+                />
+                {/* Mentioned apps tokens */}
+                <div
+                  className="h-full bg-orange-400"
+                  style={{ width: `${mentionedAppsPercent}%` }}
                 />
                 {/* System prompt tokens */}
                 <div
@@ -107,6 +101,10 @@ export function TokenBar({ chatId }: TokenBarProps) {
                 <span>Codebase</span>
                 <span>{codebaseTokens.toLocaleString()}</span>
 
+                <ExternalLink size={12} className="text-orange-500" />
+                <span>Mentioned Apps</span>
+                <span>{mentionedAppsTokens.toLocaleString()}</span>
+
                 <Bot size={12} className="text-purple-500" />
                 <span>System Prompt</span>
                 <span>{systemPromptTokens.toLocaleString()}</span>
@@ -125,26 +123,8 @@ export function TokenBar({ chatId }: TokenBarProps) {
           </TooltipContent>
         </Tooltip>
       </TooltipProvider>
-      {error && <div className="text-red-500 text-xs mt-1">{error}</div>}
-      {(!settings?.enableProSmartFilesContextMode ||
-        !settings?.enableDyadPro) && (
-        <div className="text-xs text-center text-muted-foreground mt-2">
-          Optimize your tokens with{" "}
-          <a
-            onClick={() =>
-              settings?.enableDyadPro
-                ? IpcClient.getInstance().openExternalUrl(
-                    "https://www.dyad.sh/docs/guides/ai-models/pro-modes#smart-context",
-                  )
-                : IpcClient.getInstance().openExternalUrl(
-                    "https://dyad.sh/pro#ai",
-                  )
-            }
-            className="text-blue-500 dark:text-blue-400 cursor-pointer hover:underline"
-          >
-            Dyad Pro's Smart Context
-          </a>
-        </div>
+      {error && (
+        <div className="text-red-500 text-xs mt-1">Failed to count tokens</div>
       )}
     </div>
   );

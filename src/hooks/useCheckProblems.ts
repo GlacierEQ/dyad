@@ -1,25 +1,23 @@
 import { useQuery } from "@tanstack/react-query";
-import { IpcClient } from "@/ipc/ipc_client";
-import type { ProblemReport } from "@/ipc/ipc_types";
-import { useSettings } from "./useSettings";
+import { ipc, type ProblemReport } from "@/ipc/types";
+import { queryKeys } from "@/lib/queryKeys";
+import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
 
 export function useCheckProblems(appId: number | null) {
-  const { settings } = useSettings();
   const {
     data: problemReport,
     isLoading: isChecking,
     error,
     refetch: checkProblems,
   } = useQuery<ProblemReport, Error>({
-    queryKey: ["problems", appId],
+    queryKey: queryKeys.problems.byApp({ appId }),
     queryFn: async (): Promise<ProblemReport> => {
       if (!appId) {
-        throw new Error("App ID is required");
+        throw new DyadError("App ID is required", DyadErrorKind.Validation);
       }
-      const ipcClient = IpcClient.getInstance();
-      return ipcClient.checkProblems({ appId });
+      return ipc.misc.checkProblems({ appId });
     },
-    enabled: !!appId && settings?.enableAutoFixProblems,
+    enabled: false,
     // DO NOT SHOW ERROR TOAST.
   });
 

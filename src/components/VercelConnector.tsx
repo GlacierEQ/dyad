@@ -1,10 +1,14 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
-import { Globe } from "lucide-react";
-import { IpcClient } from "@/ipc/ipc_client";
+import { Loader2 } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
+import { toast } from "sonner";
+import { ipc, App, type VercelDeployment } from "@/ipc/types";
 import { useSettings } from "@/hooks/useSettings";
 import { useLoadApp } from "@/hooks/useLoadApp";
 import { useVercelDeployments } from "@/hooks/useVercelDeployments";
+import { queryKeys } from "@/lib/queryKeys";
 import {
   Select,
   SelectContent,
@@ -15,17 +19,23 @@ import {
 import {} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { App } from "@/ipc/ipc_types";
+import { slugifyAppPath } from "@/shared/slugify";
+import {
+  RecentDeploymentsList,
+  type DeploymentTone,
+  type RecentDeploymentRow,
+} from "@/components/preview_panel/RecentDeploymentsList";
 
 interface VercelConnectorProps {
   appId: number | null;
   folderName: string;
+  deferDeployment?: boolean;
 }
 
 interface VercelProject {
   id: string;
   name: string;
-  framework: string | null;
+  framework?: string | null;
 }
 
 interface ConnectedVercelConnectorProps {
@@ -37,9 +47,32 @@ interface ConnectedVercelConnectorProps {
 interface UnconnectedVercelConnectorProps {
   appId: number | null;
   folderName: string;
+  deferDeployment?: boolean;
   settings: any;
+  neonProjectId: string | null;
   refreshSettings: () => void;
   refreshApp: () => void;
+}
+
+const VERCEL_TONES: Record<string, DeploymentTone> = {
+  READY: "success",
+  BUILDING: "pending",
+  ERROR: "failure",
+};
+
+/** A deployment as the list shows it. Vercel's states are uppercase words. */
+export function toVercelDeploymentRow(
+  deployment: VercelDeployment,
+): RecentDeploymentRow {
+  return {
+    key: deployment.uid,
+    label:
+      deployment.readyState.charAt(0) +
+      deployment.readyState.slice(1).toLowerCase(),
+    tone: VERCEL_TONES[deployment.readyState] ?? "neutral",
+    createdAt: new Date(deployment.createdAt),
+    url: `https://${deployment.url}`,
+  };
 }
 
 function ConnectedVercelConnector({
@@ -47,15 +80,30 @@ function ConnectedVercelConnector({
   app,
   refreshApp,
 }: ConnectedVercelConnectorProps) {
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const {
     deployments,
     isLoading: isLoadingDeployments,
     error: deploymentsError,
-    getDeployments: handleGetDeployments,
+    getDeployments,
     disconnectProject,
     isDisconnecting,
     disconnectError,
   } = useVercelDeployments(appId);
+
+  const handleGetDeployments = async () => {
+    setIsRefreshing(true);
+    try {
+      const minLoadingTime = new Promise((resolve) => setTimeout(resolve, 750));
+      await Promise.all([getDeployments(), minLoadingTime]);
+      // Refresh app data to get the updated deployment URL
+      refreshApp();
+    } finally {
+      setIsRefreshing(false);
+    }
+  };
+
+  const isLoadingOrRefreshing = isLoadingDeployments || isRefreshing;
 
   const handleDisconnectProject = async () => {
     await disconnectProject();
@@ -73,7 +121,7 @@ function ConnectedVercelConnector({
       <a
         onClick={(e) => {
           e.preventDefault();
-          IpcClient.getInstance().openExternalUrl(
+          ipc.system.openExternalUrl(
             `https://vercel.com/${app.vercelTeamSlug}/${app.vercelProjectName}`,
           );
         }}
@@ -91,9 +139,7 @@ function ConnectedVercelConnector({
               onClick={(e) => {
                 e.preventDefault();
                 if (app.vercelDeploymentUrl) {
-                  IpcClient.getInstance().openExternalUrl(
-                    app.vercelDeploymentUrl,
-                  );
+                  ipc.system.openExternalUrl(app.vercelDeploymentUrl);
                 }
               }}
               className="cursor-pointer text-blue-600 hover:underline dark:text-blue-400 font-mono"
@@ -106,8 +152,8 @@ function ConnectedVercelConnector({
         </div>
       )}
       <div className="mt-2 flex gap-2">
-        <Button onClick={handleGetDeployments} disabled={isLoadingDeployments}>
-          {isLoadingDeployments ? (
+        <Button onClick={handleGetDeployments} disabled={isLoadingOrRefreshing}>
+          {isLoadingOrRefreshing ? (
             <>
               <svg
                 className="animate-spin h-5 w-5 mr-2 inline"
@@ -130,7 +176,7 @@ function ConnectedVercelConnector({
                   d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
                 ></path>
               </svg>
-              Getting Deployments...
+              Refreshing...
             </>
           ) : (
             "Refresh Deployments"
@@ -149,52 +195,10 @@ function ConnectedVercelConnector({
           <p className="text-red-600">{deploymentsError}</p>
         </div>
       )}
-      {deployments.length > 0 && (
-        <div className="mt-4">
-          <h4 className="font-medium mb-2">Recent Deployments:</h4>
-          <div className="space-y-2">
-            {deployments.map((deployment) => (
-              <div
-                key={deployment.uid}
-                className="bg-gray-50 dark:bg-gray-800 rounded-md p-3"
-              >
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <span
-                      className={`inline-flex items-center px-2 py-1 rounded-full text-xs font-medium ${
-                        deployment.readyState === "READY"
-                          ? "bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-300"
-                          : deployment.readyState === "BUILDING"
-                            ? "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-300"
-                            : "bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-300"
-                      }`}
-                    >
-                      {deployment.readyState}
-                    </span>
-                    <span className="text-sm text-gray-600 dark:text-gray-300">
-                      {new Date(deployment.createdAt).toLocaleString()}
-                    </span>
-                  </div>
-                  <a
-                    onClick={(e) => {
-                      e.preventDefault();
-                      IpcClient.getInstance().openExternalUrl(
-                        `https://${deployment.url}`,
-                      );
-                    }}
-                    className="cursor-pointer text-blue-600 hover:underline dark:text-blue-400 text-sm"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    <Globe className="h-4 w-4 inline mr-1" />
-                    View
-                  </a>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+      <RecentDeploymentsList
+        className="mt-4"
+        rows={deployments.map(toVercelDeploymentRow)}
+      />
       {disconnectError && (
         <p className="text-red-600 mt-2">{disconnectError}</p>
       )}
@@ -205,10 +209,13 @@ function ConnectedVercelConnector({
 function UnconnectedVercelConnector({
   appId,
   folderName,
+  deferDeployment,
   settings,
+  neonProjectId,
   refreshSettings,
   refreshApp,
 }: UnconnectedVercelConnectorProps) {
+  const { t } = useTranslation("home");
   // --- Manual Token Entry State ---
   const [accessToken, setAccessToken] = useState("");
   const [isSavingToken, setIsSavingToken] = useState(false);
@@ -225,8 +232,12 @@ function UnconnectedVercelConnector({
   const [isLoadingProjects, setIsLoadingProjects] = useState(false);
   const [selectedProject, setSelectedProject] = useState<string>("");
 
-  // Create new project state
-  const [projectName, setProjectName] = useState(folderName);
+  // Create new project state. Seed with a kebab-case slug of the app name (the
+  // same transform used for the app folder path) since Vercel requires
+  // lowercase project names.
+  const [projectName, setProjectName] = useState(() =>
+    slugifyAppPath(folderName),
+  );
   const [projectAvailable, setProjectAvailable] = useState<boolean | null>(
     null,
   );
@@ -259,10 +270,25 @@ function UnconnectedVercelConnector({
     };
   }, []);
 
+  // For Neon-connected apps, preview what will be auto-configured on Vercel
+  // (env var keys + trusted domains) so the user approves before deploying.
+  const showSyncPreview =
+    !!neonProjectId && appId !== null && projectSetupMode === "create";
+  const {
+    data: syncPreview,
+    isLoading: isSyncPreviewLoading,
+    error: syncPreviewError,
+  } = useQuery({
+    queryKey: queryKeys.vercel.syncPreview({ appId }),
+    queryFn: () => ipc.vercel.getSyncPreview({ appId: appId! }),
+    enabled: showSyncPreview,
+    staleTime: 60 * 1000,
+  });
+
   const loadAvailableProjects = async () => {
     setIsLoadingProjects(true);
     try {
-      const projects = await IpcClient.getInstance().listVercelProjects();
+      const projects = await ipc.vercel.listProjects();
       setAvailableProjects(projects);
     } catch (error) {
       console.error("Failed to load Vercel projects:", error);
@@ -280,7 +306,7 @@ function UnconnectedVercelConnector({
     setTokenSuccess(false);
 
     try {
-      await IpcClient.getInstance().saveVercelAccessToken({
+      await ipc.vercel.saveToken({
         token: accessToken.trim(),
       });
       setTokenSuccess(true);
@@ -299,7 +325,7 @@ function UnconnectedVercelConnector({
     if (!name) return;
     setIsCheckingProject(true);
     try {
-      const result = await IpcClient.getInstance().isVercelProjectAvailable({
+      const result = await ipc.vercel.isProjectAvailable({
         name,
       });
       setProjectAvailable(result.available);
@@ -337,12 +363,16 @@ function UnconnectedVercelConnector({
 
     try {
       if (projectSetupMode === "create") {
-        await IpcClient.getInstance().createVercelProject({
+        const result = await ipc.vercel.createProject({
           name: projectName,
           appId,
+          deferDeployment,
         });
+        if (result?.syncWarning) {
+          toast.warning(result.syncWarning);
+        }
       } else {
-        await IpcClient.getInstance().connectToExistingVercelProject({
+        await ipc.vercel.connectExistingProject({
           projectId: selectedProject,
           appId,
         });
@@ -383,9 +413,7 @@ function UnconnectedVercelConnector({
               <div className="flex gap-2 mt-3">
                 <Button
                   onClick={() => {
-                    IpcClient.getInstance().openExternalUrl(
-                      "https://vercel.com/signup",
-                    );
+                    ipc.system.openExternalUrl("https://vercel.com/signup");
                   }}
                   variant="outline"
                   className="flex-1"
@@ -394,7 +422,7 @@ function UnconnectedVercelConnector({
                 </Button>
                 <Button
                   onClick={() => {
-                    IpcClient.getInstance().openExternalUrl(
+                    ipc.system.openExternalUrl(
                       "https://vercel.com/account/settings/tokens",
                     );
                   }}
@@ -561,6 +589,46 @@ function UnconnectedVercelConnector({
                     </p>
                   )}
                 </div>
+
+                {showSyncPreview &&
+                  (isSyncPreviewLoading || syncPreviewError || syncPreview) && (
+                    <div
+                      className="bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-md p-3"
+                      data-testid="vercel-sync-preview"
+                    >
+                      <p className="text-sm font-medium text-blue-800 dark:text-blue-200 mb-1">
+                        {t("integrations.vercel.syncPreviewTitle")}
+                      </p>
+                      {isSyncPreviewLoading ? (
+                        <p className="flex items-center gap-2 text-xs text-blue-700 dark:text-blue-300">
+                          <Loader2 className="w-3 h-3 animate-spin" />
+                          {t("integrations.vercel.syncPreviewLoading")}
+                        </p>
+                      ) : syncPreviewError ? (
+                        <p className="text-xs text-red-600 dark:text-red-400">
+                          {t("integrations.vercel.syncPreviewError")}
+                        </p>
+                      ) : syncPreview ? (
+                        <>
+                          <p className="text-xs text-blue-700 dark:text-blue-300 mb-2">
+                            {t("integrations.vercel.syncPreviewIntro", {
+                              branchType: syncPreview.branchType,
+                            })}
+                          </p>
+                          <ul className="list-disc list-inside text-xs font-mono text-blue-800 dark:text-blue-200 space-y-0.5">
+                            {syncPreview.envKeys.map((key) => (
+                              <li key={key}>{key}</li>
+                            ))}
+                          </ul>
+                          {syncPreview.authActive && (
+                            <p className="text-xs text-blue-700 dark:text-blue-300 mt-2">
+                              {t("integrations.vercel.syncPreviewAuthDomain")}
+                            </p>
+                          )}
+                        </>
+                      ) : null}
+                    </div>
+                  )}
               </>
             ) : (
               <>
@@ -570,7 +638,7 @@ function UnconnectedVercelConnector({
                   </Label>
                   <Select
                     value={selectedProject}
-                    onValueChange={setSelectedProject}
+                    onValueChange={(v) => setSelectedProject(v ?? "")}
                     disabled={isLoadingProjects}
                   >
                     <SelectTrigger
@@ -633,7 +701,11 @@ function UnconnectedVercelConnector({
   );
 }
 
-export function VercelConnector({ appId, folderName }: VercelConnectorProps) {
+export function VercelConnector({
+  appId,
+  folderName,
+  deferDeployment,
+}: VercelConnectorProps) {
   const { app, refreshApp } = useLoadApp(appId);
   const { settings, refreshSettings } = useSettings();
 
@@ -650,7 +722,9 @@ export function VercelConnector({ appId, folderName }: VercelConnectorProps) {
       <UnconnectedVercelConnector
         appId={appId}
         folderName={folderName}
+        deferDeployment={deferDeployment}
         settings={settings}
+        neonProjectId={app?.neonProjectId ?? null}
         refreshSettings={refreshSettings}
         refreshApp={refreshApp}
       />

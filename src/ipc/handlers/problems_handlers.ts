@@ -1,18 +1,22 @@
 import { db } from "../../db";
-
 import { apps } from "../../db/schema";
 import { eq } from "drizzle-orm";
-import { generateProblemReport } from "../processors/tsc";
+import {
+  runTypeScriptCheck,
+  getTypeCheckPreconditionGuidance,
+  getTypeCheckPreconditionKind,
+} from "../processors/tsc";
 import { getDyadAppPath } from "@/paths/paths";
 import log from "electron-log";
-import { createLoggedHandler } from "./safe_handle";
+import { createTypedHandler } from "./base";
+import { miscContracts } from "../types/misc";
+import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
 
 const logger = log.scope("problems_handlers");
-const handle = createLoggedHandler(logger);
 
 export function registerProblemsHandlers() {
-  // Handler to check problems using autofix with empty response
-  handle("check-problems", async (event, params: { appId: number }) => {
+  createTypedHandler(miscContracts.checkProblems, async (_, params) => {
+    let appPath = "";
     try {
       // Get the app to find its path
       const app = await db.query.apps.findFirst({
@@ -20,19 +24,34 @@ export function registerProblemsHandlers() {
       });
 
       if (!app) {
-        throw new Error(`App not found: ${params.appId}`);
+        throw new DyadError(
+          `App not found: ${params.appId}`,
+          DyadErrorKind.NotFound,
+        );
       }
 
-      const appPath = getDyadAppPath(app.path);
+      appPath = getDyadAppPath(app.path);
 
-      // Call autofix with empty full response to just run TypeScript checking
-      const problemReport = await generateProblemReport({
-        fullResponse: "",
-        appPath,
-      });
+      const problemReport = await runTypeScriptCheck({ appPath });
 
       return problemReport;
     } catch (error) {
+      const preconditionKind = getTypeCheckPreconditionKind(error);
+      if (preconditionKind) {
+        if (!appPath) {
+          throw error;
+        }
+
+        const message = await getTypeCheckPreconditionGuidance({
+          kind: preconditionKind,
+          appPath,
+        });
+        logger.info("Type checking precondition failed:", message);
+        throw new DyadError(message, DyadErrorKind.Precondition, {
+          cause: error,
+        });
+      }
+
       logger.error("Error checking problems:", error);
       throw error;
     }

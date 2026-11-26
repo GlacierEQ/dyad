@@ -111,7 +111,7 @@ const testWithMultipleBackups = testWithConfig({
 const ensureAppIsRunning = async (po: PageObject) => {
   await po.page.waitForSelector("h1");
   const text = await po.page.$eval("h1", (el) => el.textContent);
-  expect(text).toBe("Build your dream app");
+  expect(text).toBe("What do you want to build?");
 };
 
 test("backup is not created for first run", async ({ po }) => {
@@ -182,7 +182,11 @@ testWithMultipleBackups(
     for (let backup of expectedRemainingBackups) {
       let expectedBackup = backup;
       if (backup === "*") {
-        expectedBackup = backups[0];
+        const upgradeBackup = backups.find((name) =>
+          name.endsWith("_upgrade_from_0.1.0"),
+        );
+        expect(upgradeBackup).toBeDefined();
+        expectedBackup = upgradeBackup!;
         expect(expectedBackup.endsWith("_upgrade_from_0.1.0")).toEqual(true);
       } else {
         expect(backups).toContain(expectedBackup);

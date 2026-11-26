@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useAtom, useAtomValue } from "jotai";
 import { selectedChatIdAtom } from "@/atoms/chatAtoms";
 import { selectedAppIdAtom } from "@/atoms/appAtoms";
@@ -9,24 +9,54 @@ import {
   Wrench,
   RefreshCw,
   Check,
+  Info,
 } from "lucide-react";
-import { Problem, ProblemReport } from "@/ipc/ipc_types";
+import { Problem, ProblemReport } from "@/ipc/types";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 
 import { useStreamChat } from "@/hooks/useStreamChat";
 import { useCheckProblems } from "@/hooks/useCheckProblems";
+import { useChatMode } from "@/hooks/useChatMode";
 import { createProblemFixPrompt } from "@/shared/problem_prompt";
 import { showError } from "@/lib/toast";
+import { useTranslation } from "react-i18next";
 
 interface ProblemItemProps {
   problem: Problem;
+  checked: boolean;
+  isIncomplete?: boolean;
+  onToggle: () => void;
 }
 
-const ProblemItem = ({ problem }: ProblemItemProps) => {
+const ProblemItem = ({
+  problem,
+  checked,
+  isIncomplete,
+  onToggle,
+}: ProblemItemProps) => {
+  const { t } = useTranslation(["home", "common"]);
   return (
-    <div className="flex items-start gap-3 p-3 border-b border-border hover:bg-[var(--background-darkest)] transition-colors">
+    <div
+      role="checkbox"
+      aria-checked={checked}
+      onClick={onToggle}
+      className="cursor-pointer flex items-start gap-3 p-3 border-b border-border hover:bg-[var(--background-darker)] dark:hover:bg-[var(--background-lightest)] transition-colors"
+      data-testid="problem-row"
+    >
+      <Checkbox
+        checked={checked}
+        onCheckedChange={onToggle}
+        onClick={(e) => e.stopPropagation()}
+        className="mt-0.5"
+        aria-label={t("home:preview.problems_panel.selectProblem")}
+      />
       <div className="flex-shrink-0 mt-0.5">
-        <XCircle size={16} className="text-red-500" />
+        {isIncomplete ? (
+          <AlertTriangle size={16} className="text-amber-500" />
+        ) : (
+          <XCircle size={16} className="text-red-500" />
+        )}
       </div>
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 mb-1">
@@ -56,6 +86,7 @@ interface RecheckButtonProps {
     | "ghost"
     | "link";
   className?: string;
+  onBeforeRecheck?: () => void;
 }
 
 const RecheckButton = ({
@@ -63,11 +94,16 @@ const RecheckButton = ({
   size = "sm",
   variant = "outline",
   className = "h-7 px-3 text-xs",
+  onBeforeRecheck,
 }: RecheckButtonProps) => {
+  const { t } = useTranslation(["home", "common"]);
   const { checkProblems, isChecking } = useCheckProblems(appId);
   const [showingFeedback, setShowingFeedback] = useState(false);
 
   const handleRecheck = async () => {
+    if (onBeforeRecheck) {
+      onBeforeRecheck();
+    }
     setShowingFeedback(true);
 
     const res = await checkProblems();
@@ -94,7 +130,9 @@ const RecheckButton = ({
         size={14}
         className={`mr-1 ${isShowingChecking ? "animate-spin" : ""}`}
       />
-      {isShowingChecking ? "Checking..." : "Run checks"}
+      {isShowingChecking
+        ? t("home:preview.problems_panel.checkingProblems")
+        : t("home:preview.problems_panel.runChecks")}
     </Button>
   );
 };
@@ -102,29 +140,32 @@ const RecheckButton = ({
 interface ProblemsSummaryProps {
   problemReport: ProblemReport;
   appId: number;
+  selectedCount: number;
+  onClearAll: () => void;
+  onFixSelected: () => void;
+  onSelectAll: () => void;
 }
 
-const ProblemsSummary = ({ problemReport, appId }: ProblemsSummaryProps) => {
-  const { streamMessage } = useStreamChat();
+const ProblemsSummary = ({
+  problemReport,
+  appId,
+  selectedCount,
+  onClearAll,
+  onFixSelected,
+  onSelectAll,
+}: ProblemsSummaryProps) => {
+  const { t } = useTranslation(["home", "common"]);
   const { problems } = problemReport;
   const totalErrors = problems.length;
-  const [selectedChatId] = useAtom(selectedChatIdAtom);
+  const isIncomplete = problemReport.outcome === "incomplete";
 
-  const handleFixAll = () => {
-    if (!selectedChatId) {
-      return;
-    }
-    streamMessage({
-      prompt: createProblemFixPrompt(problemReport),
-      chatId: selectedChatId,
-    });
-  };
+  // Keep stream hook mounted; actual fix action is provided via onFixSelected
 
-  if (problems.length === 0) {
+  if (problems.length === 0 && !isIncomplete) {
     return (
       <div className="flex flex-col items-center justify-center h-32 text-center">
         <p className="mt-6 text-sm font-medium text-muted-foreground mb-3">
-          No problems found
+          {t("home:preview.problems_panel.noProblemsFound")}
         </p>
         <div className="w-12 h-12 rounded-full bg-green-100 dark:bg-green-900/20 flex items-center justify-center mb-3">
           <Check size={20} className="text-green-600 dark:text-green-400" />
@@ -138,26 +179,55 @@ const ProblemsSummary = ({ problemReport, appId }: ProblemsSummaryProps) => {
   return (
     <div className="flex items-center justify-between px-4 py-3 bg-[var(--background-darkest)] border-b border-border">
       <div className="flex items-center gap-4">
-        {totalErrors > 0 && (
+        {isIncomplete ? (
+          <div className="flex items-center gap-2">
+            <AlertTriangle size={16} className="text-amber-500" />
+            <span className="text-sm font-medium">
+              {t("home:preview.problems_panel.typeCheckIncomplete")}
+            </span>
+          </div>
+        ) : totalErrors > 0 ? (
           <div className="flex items-center gap-2">
             <XCircle size={16} className="text-red-500" />
             <span className="text-sm font-medium">
-              {totalErrors} {totalErrors === 1 ? "error" : "errors"}
+              {t("home:preview.problems_panel.error", { count: totalErrors })}
             </span>
           </div>
-        )}
+        ) : null}
       </div>
       <div className="flex items-center gap-2">
-        <RecheckButton appId={appId} />
+        <RecheckButton appId={appId} onBeforeRecheck={onClearAll} />
+        {selectedCount === 0 ? (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={onSelectAll}
+            className="h-7 px-3 text-xs"
+          >
+            {t("common:selectAll")}
+          </Button>
+        ) : (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={onClearAll}
+            className="h-7 px-3 text-xs"
+          >
+            {t("common:clearAll")}
+          </Button>
+        )}
         <Button
           size="sm"
           variant="default"
-          onClick={handleFixAll}
+          onClick={onFixSelected}
           className="h-7 px-3 text-xs"
           data-testid="fix-all-button"
+          disabled={selectedCount === 0}
         >
           <Wrench size={14} className="mr-1" />
-          Fix All
+          {t("home:preview.problems_panel.fixProblems", {
+            count: selectedCount,
+          })}
         </Button>
       </div>
     </div>
@@ -173,8 +243,25 @@ export function Problems() {
 }
 
 export function _Problems() {
+  const { t } = useTranslation(["home", "common"]);
   const selectedAppId = useAtomValue(selectedAppIdAtom);
-  const { problemReport } = useCheckProblems(selectedAppId);
+  const { problemReport, error } = useCheckProblems(selectedAppId);
+  const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
+  const problemKey = (p: Problem) =>
+    `${p.file}:${p.line}:${p.column}:${p.code}`;
+  const { streamMessage } = useStreamChat();
+  const [selectedChatId] = useAtom(selectedChatIdAtom);
+  const { selectedMode } = useChatMode(selectedChatId);
+  const isLocalAgentMode = selectedMode === "local-agent";
+
+  // Whenever the problems pane is shown or the report updates, select all problems
+  useEffect(() => {
+    if (problemReport?.problems?.length) {
+      setSelectedKeys(new Set(problemReport.problems.map(problemKey)));
+    } else {
+      setSelectedKeys(new Set());
+    }
+  }, [problemReport]);
 
   if (!selectedAppId) {
     return (
@@ -182,10 +269,32 @@ export function _Problems() {
         <div className="w-16 h-16 rounded-full bg-[var(--background-darkest)] flex items-center justify-center mb-4">
           <AlertTriangle size={24} className="text-muted-foreground" />
         </div>
-        <h3 className="text-lg font-medium mb-2">No App Selected</h3>
+        <h3 className="text-lg font-medium mb-2">
+          {t("home:preview.problems_panel.noAppSelectedTitle")}
+        </h3>
         <p className="text-sm text-muted-foreground max-w-md">
-          Select an app to view TypeScript problems and diagnostic information.
+          {t("home:preview.problems_panel.noAppSelectedDescription")}
         </p>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full text-center p-8">
+        <div className="w-16 h-16 rounded-full bg-[var(--background-darkest)] flex items-center justify-center mb-4">
+          <AlertTriangle size={24} className="text-muted-foreground" />
+        </div>
+        <h3 className="text-lg font-medium mb-2">
+          {t("home:preview.problems_panel.noProblemsReportTitle")}
+        </h3>
+        <p className="text-sm text-muted-foreground max-w-md mb-4">
+          {error.message}
+        </p>
+        <RecheckButton
+          appId={selectedAppId}
+          onBeforeRecheck={() => setSelectedKeys(new Set())}
+        />
       </div>
     );
   }
@@ -196,25 +305,81 @@ export function _Problems() {
         <div className="w-16 h-16 rounded-full bg-[var(--background-darkest)] flex items-center justify-center mb-4">
           <AlertTriangle size={24} className="text-muted-foreground" />
         </div>
-        <h3 className="text-lg font-medium mb-2">No Problems Report</h3>
+        <h3 className="text-lg font-medium mb-2">
+          {t("home:preview.problems_panel.noProblemsReportTitle")}
+        </h3>
         <p className="text-sm text-muted-foreground max-w-md mb-4">
-          Run checks to scan your app for TypeScript errors and other problems.
+          {t("home:preview.problems_panel.noProblemsReportDescription")}
         </p>
-        <RecheckButton appId={selectedAppId} />
+        <RecheckButton
+          appId={selectedAppId}
+          onBeforeRecheck={() => setSelectedKeys(new Set())}
+        />
       </div>
     );
   }
 
   return (
     <div className="flex flex-col h-full">
-      <ProblemsSummary problemReport={problemReport} appId={selectedAppId} />
+      {isLocalAgentMode && (
+        <div
+          className="flex items-start gap-2 px-4 py-2 text-xs text-muted-foreground border-b border-border"
+          data-testid="problems-agent-mode-notice"
+        >
+          <Info size={14} className="mt-0.5 flex-shrink-0" />
+          <span>{t("home:preview.problems_panel.agentModeNotice")}</span>
+        </div>
+      )}
+      <ProblemsSummary
+        problemReport={problemReport}
+        appId={selectedAppId}
+        selectedCount={
+          [...selectedKeys].filter((key) =>
+            problemReport.problems.some((p) => problemKey(p) === key),
+          ).length
+        }
+        onClearAll={() => setSelectedKeys(new Set())}
+        onSelectAll={() =>
+          setSelectedKeys(
+            new Set(problemReport.problems.map((p) => problemKey(p))),
+          )
+        }
+        onFixSelected={() => {
+          if (!selectedChatId) return;
+          const selectedProblems = problemReport.problems.filter((p) =>
+            selectedKeys.has(problemKey(p)),
+          );
+          const subsetReport: ProblemReport = { problems: selectedProblems };
+          streamMessage({
+            prompt: createProblemFixPrompt(subsetReport),
+            chatId: selectedChatId,
+          });
+        }}
+      />
       <div className="flex-1 overflow-y-auto">
-        {problemReport.problems.map((problem, index) => (
-          <ProblemItem
-            key={`${problem.file}-${problem.line}-${problem.column}-${index}`}
-            problem={problem}
-          />
-        ))}
+        {problemReport.problems.map((problem) => {
+          const selKey = problemKey(problem);
+          const checked = selectedKeys.has(selKey);
+          return (
+            <ProblemItem
+              key={selKey}
+              problem={problem}
+              checked={checked}
+              isIncomplete={problemReport.outcome === "incomplete"}
+              onToggle={() => {
+                setSelectedKeys((prev) => {
+                  const next = new Set(prev);
+                  if (next.has(selKey)) {
+                    next.delete(selKey);
+                  } else {
+                    next.add(selKey);
+                  }
+                  return next;
+                });
+              }}
+            />
+          );
+        })}
       </div>
     </div>
   );

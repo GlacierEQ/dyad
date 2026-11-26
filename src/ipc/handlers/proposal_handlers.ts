@@ -6,7 +6,7 @@ import type {
 } from "../../lib/schemas";
 import { db } from "../../db";
 import { messages, chats } from "../../db/schema";
-import { desc, eq, and } from "drizzle-orm";
+import { desc, eq, and, sql } from "drizzle-orm";
 import path from "node:path"; // Import path for basename
 // Import tag parsers
 import { processFullResponseActions } from "../processors/response_processor";
@@ -18,6 +18,7 @@ import {
   getDyadAddDependencyTags,
   getDyadChatSummaryTag,
   getDyadCommandTags,
+  getDyadSearchReplaceTags,
 } from "../utils/dyad_tag_parser";
 import log from "electron-log";
 import { isServerFunction } from "../../supabase_admin/supabase_utils";
@@ -30,9 +31,14 @@ import { extractCodebase } from "../../utils/codebase";
 import { getDyadAppPath } from "../../paths/paths";
 import { withLock } from "../utils/lock_utils";
 import { createLoggedHandler } from "./safe_handle";
-import { ApproveProposalResult } from "../ipc_types";
+import { ApproveProposalResult } from "@/ipc/types";
 import { validateChatContext } from "../utils/context_paths_utils";
 import { readSettings } from "@/main/settings";
+import { resolveChatModeForTurn } from "./chat_mode_resolution";
+import {
+  normalizeModelSelection,
+  resolveDefaultModelSelection,
+} from "@/ipc/utils/model_effort";
 
 const logger = log.scope("proposal_handlers");
 const handle = createLoggedHandler(logger);
@@ -65,7 +71,7 @@ function cleanupExpiredCacheEntries() {
   });
 
   if (expiredCount > 0) {
-    logger.log(
+    logger.debug(
       `Cleaned up ${expiredCount} expired codebase token cache entries`,
     );
   }
@@ -93,12 +99,12 @@ async function getCodebaseTokenCount(
     cacheEntry.chatContext === JSON.stringify(chatContext) &&
     now - cacheEntry.timestamp < CACHE_EXPIRATION_MS
   ) {
-    logger.log(`Using cached codebase token count for chatId: ${chatId}`);
+    logger.debug(`Using cached codebase token count for chatId: ${chatId}`);
     return cacheEntry.tokenCount;
   }
 
   // Calculate and cache the token count
-  logger.log(`Calculating codebase token count for chatId: ${chatId}`);
+  logger.debug(`Calculating codebase token count for chatId: ${chatId}`);
   const codebase = (
     await extractCodebase({
       appPath: getDyadAppPath(appPath),
@@ -125,19 +131,33 @@ const getProposalHandler = async (
   { chatId }: { chatId: number },
 ): Promise<ProposalResult | null> => {
   return withLock("get-proposal:" + chatId, async () => {
-    logger.log(`IPC: get-proposal called for chatId: ${chatId}`);
+    logger.debug(`IPC: get-proposal called for chatId: ${chatId}`);
 
     try {
       // Find the latest ASSISTANT message for the chat
       const latestAssistantMessage = await db.query.messages.findFirst({
         where: and(eq(messages.chatId, chatId), eq(messages.role, "assistant")),
-        orderBy: [desc(messages.createdAt)],
+        orderBy: [desc(messages.createdAt), desc(messages.id)],
         columns: {
           id: true, // Fetch the ID
           content: true, // Fetch the content to parse
           approvalState: true,
         },
+        extras: {
+          hasAiMessagesJson:
+            sql<boolean>`${messages.aiMessagesJson} is not null`.as(
+              "has_ai_messages_json",
+            ),
+        },
       });
+
+      // Local Agent stores its structured transcript here. Its XML is a
+      // renderer projection of tool calls that already executed, not a legacy
+      // proposal awaiting approval. This also protects interrupted Agent turns
+      // created before agentic messages were eagerly marked approved.
+      if (latestAssistantMessage?.hasAiMessagesJson) {
+        return null;
+      }
 
       if (
         latestAssistantMessage?.content &&
@@ -145,7 +165,7 @@ const getProposalHandler = async (
         !latestAssistantMessage?.approvalState
       ) {
         const messageId = latestAssistantMessage.id; // Get the message ID
-        logger.log(
+        logger.debug(
           `Found latest assistant message (ID: ${messageId}), parsing content...`,
         );
         const messageContent = latestAssistantMessage.content;
@@ -153,19 +173,23 @@ const getProposalHandler = async (
         const proposalTitle = getDyadChatSummaryTag(messageContent);
 
         const proposalWriteFiles = getDyadWriteTags(messageContent);
+        const proposalSearchReplaceFiles =
+          getDyadSearchReplaceTags(messageContent);
         const proposalRenameFiles = getDyadRenameTags(messageContent);
         const proposalDeleteFiles = getDyadDeleteTags(messageContent);
         const proposalExecuteSqlQueries = getDyadExecuteSqlTags(messageContent);
         const packagesAdded = getDyadAddDependencyTags(messageContent);
 
         const filesChanged = [
-          ...proposalWriteFiles.map((tag) => ({
-            name: path.basename(tag.path),
-            path: tag.path,
-            summary: tag.description ?? "(no change summary found)", // Generic summary
-            type: "write" as const,
-            isServerFunction: isServerFunction(tag.path),
-          })),
+          ...proposalWriteFiles
+            .concat(proposalSearchReplaceFiles)
+            .map((tag) => ({
+              name: path.basename(tag.path),
+              path: tag.path,
+              summary: tag.description ?? "(no change summary found)", // Generic summary
+              type: "write" as const,
+              isServerFunction: isServerFunction(tag.path),
+            })),
           ...proposalRenameFiles.map((tag) => ({
             name: path.basename(tag.to),
             path: tag.to,
@@ -199,7 +223,7 @@ const getProposalHandler = async (
               description: query.description,
             })),
           };
-          logger.log(
+          logger.debug(
             "Generated code proposal. title=",
             proposal.title,
             "files=",
@@ -214,7 +238,7 @@ const getProposalHandler = async (
             messageId,
           };
         } else {
-          logger.log(
+          logger.debug(
             "No relevant tags found in the latest assistant message content.",
           );
         }
@@ -272,12 +296,19 @@ const getProposalHandler = async (
         with: {
           app: true,
           messages: {
-            orderBy: (messages, { asc }) => [asc(messages.createdAt)],
+            orderBy: (messages, { asc }) => [
+              asc(messages.createdAt),
+              asc(messages.id),
+            ],
           },
         },
       });
 
       if (latestAssistantMessage && chat) {
+        const storedSettings = readSettings();
+        const selectedModel = chat.modelSelection
+          ? await normalizeModelSelection(chat.modelSelection)
+          : await resolveDefaultModelSelection(storedSettings);
         // Calculate total tokens from message history
         const messagesTokenCount = estimateMessagesTokens(chat.messages);
 
@@ -291,16 +322,17 @@ const getProposalHandler = async (
         );
 
         const totalTokens = messagesTokenCount + codebaseTokenCount;
-        const contextWindow = Math.min(await getContextWindow(), 100_000);
-        logger.log(
-          `Token usage: ${totalTokens}/${contextWindow} (${
-            (totalTokens / contextWindow) * 100
-          }%)`,
+        const contextWindow = Math.min(
+          await getContextWindow(selectedModel),
+          100_000,
+        );
+        logger.debug(
+          `Token usage: ${totalTokens}/${contextWindow} (${(totalTokens / contextWindow) * 100}%)`,
         );
 
         // If we're using more than 80% of the context window, suggest summarizing
         if (totalTokens > contextWindow * 0.8 || chat.messages.length > 10) {
-          logger.log(
+          logger.debug(
             `Token usage is high (${totalTokens}/${contextWindow}) OR long chat history (${chat.messages.length} messages), suggesting summarize action`,
           );
           actions.push({
@@ -334,8 +366,20 @@ const approveProposalHandler = async (
   _event: IpcMainInvokeEvent,
   { chatId, messageId }: { chatId: number; messageId: number },
 ): Promise<ApproveProposalResult> => {
-  const settings = readSettings();
-  if (settings.selectedChatMode === "ask") {
+  const storedSettings = readSettings();
+  const chat = await db.query.chats.findFirst({
+    where: eq(chats.id, chatId),
+    columns: { chatMode: true, modelSelection: true },
+  });
+  const selectedModel = chat?.modelSelection
+    ? await normalizeModelSelection(chat.modelSelection)
+    : await resolveDefaultModelSelection(storedSettings);
+  const settings = { ...storedSettings, selectedModel };
+  const { mode: selectedChatMode } = await resolveChatModeForTurn({
+    storedChatMode: chat?.chatMode ?? null,
+    settings,
+  });
+  if (selectedChatMode === "ask") {
     throw new Error(
       "Ask mode is not supported for proposal approval. Please switch to build mode.",
     );
@@ -370,14 +414,20 @@ const approveProposalHandler = async (
   );
 
   if (processResult.error) {
-    throw new Error(
-      `Error processing actions for message ${messageId}: ${processResult.error}`,
-    );
+    return {
+      success: false,
+      error: `Error processing actions for message ${messageId}: ${processResult.error}`,
+      extraFiles: processResult.extraFiles,
+      extraFilesError: processResult.extraFilesError,
+      warningMessages: processResult.warningMessages,
+    };
   }
 
   return {
+    success: true,
     extraFiles: processResult.extraFiles,
     extraFilesError: processResult.extraFilesError,
+    warningMessages: processResult.warningMessages,
   };
 };
 
@@ -386,7 +436,7 @@ const rejectProposalHandler = async (
   _event: IpcMainInvokeEvent,
   { chatId, messageId }: { chatId: number; messageId: number },
 ): Promise<void> => {
-  logger.log(
+  logger.debug(
     `IPC: reject-proposal called for chatId: ${chatId}, messageId: ${messageId}`,
   );
 
@@ -412,7 +462,7 @@ const rejectProposalHandler = async (
     .set({ approvalState: "rejected" })
     .where(eq(messages.id, messageId));
 
-  logger.log(`Message ${messageId} marked as rejected.`);
+  logger.debug(`Message ${messageId} marked as rejected.`);
 };
 
 // Function to register proposal-related handlers

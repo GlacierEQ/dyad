@@ -1,3 +1,4 @@
+import { SubscriptionLimitBanner } from "@/components/SubscriptionConnectionStatus";
 import {
   StopCircleIcon,
   X,
@@ -14,20 +15,27 @@ import {
   Database,
   ChevronsUpDown,
   ChevronsDownUp,
-  ChartColumnIncreasing,
   SendHorizontalIcon,
+  Lock,
+  Mic,
+  MicOff,
 } from "lucide-react";
 import type React from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useMemo } from "react";
+import { useTranslation } from "react-i18next";
+import { getNpmPackagePageUrl } from "./npmPackageUrl";
 
 import { useSettings } from "@/hooks/useSettings";
-import { IpcClient } from "@/ipc/ipc_client";
+import { useChatMessages } from "@/hooks/useChatMessages";
+import { ipc } from "@/ipc/types";
 import {
-  chatInputValueAtom,
-  chatMessagesAtom,
+  chatInputValuesByIdAtom,
+  chatMessagesByIdAtom,
   selectedChatIdAtom,
+  agentTodosByChatIdAtom,
 } from "@/atoms/chatAtoms";
-import { atom, useAtom, useSetAtom, useAtomValue } from "jotai";
+import { chatAnnotationsAtom } from "@/atoms/chatAnnotationAtoms";
+import { atom, useAtom, useSetAtom, useAtomValue, useStore } from "jotai";
 import { useStreamChat } from "@/hooks/useStreamChat";
 import { selectedAppIdAtom } from "@/atoms/appAtoms";
 import { Button } from "@/components/ui/button";
@@ -39,65 +47,259 @@ import {
   FileChange,
   SqlQuery,
 } from "@/lib/schemas";
-import type { Message } from "@/ipc/ipc_types";
+
 import { isPreviewOpenAtom } from "@/atoms/viewAtoms";
 import { useRunApp } from "@/hooks/useRunApp";
-import { AutoApproveSwitch } from "../AutoApproveSwitch";
 import { usePostHog } from "posthog-js/react";
 import { CodeHighlight } from "./CodeHighlight";
 import { TokenBar } from "./TokenBar";
+
+import { useVersions } from "@/hooks/useVersions";
+import { useAttachments } from "@/hooks/useAttachments";
+import { useAppMediaFiles } from "@/hooks/useAppMediaFiles";
+import { useLoadApps } from "@/hooks/useLoadApps";
+import { buildOptimisticChatDisplay } from "@/lib/optimisticChatDisplay";
+import { AttachmentsList } from "./AttachmentsList";
+import { DragDropOverlay } from "./DragDropOverlay";
+import { FileAttachmentTypeDialog } from "./FileAttachmentTypeDialog";
+import { showExtraFilesToast, showWarning } from "@/lib/toast";
+import { useSummarizeInNewChat } from "./SummarizeInNewChatButton";
+import { ChatInputControls } from "../ChatInputControls";
+import { ChatErrorBox } from "./ChatErrorBox";
+import { AgentConsentBanner } from "./AgentConsentBanner";
+import { CancellationBanner } from "./CancellationBanner";
+import { useCancellationRequestLatch } from "./useCancellationRequestLatch";
+import { TodoList } from "./TodoList";
+import { QuestionnaireInput } from "./QuestionnaireInput";
+import { QueuedMessagesList } from "./QueuedMessagesList";
+import { TestAssertionsInput } from "./TestAssertionsInput";
+import {
+  selectedComponentsPreviewAtom,
+  previewIframeRefAtom,
+  visualEditingSelectedComponentAtom,
+  currentComponentCoordinatesAtom,
+  pendingVisualChangesAtom,
+} from "@/atoms/previewAtoms";
+import { SelectedComponentsDisplay } from "./SelectedComponentDisplay";
+import { LexicalChatInput } from "./LexicalChatInput";
+import { AuxiliaryActionsMenu } from "./AuxiliaryActionsMenu";
+import {
+  doesSqlDeleteData,
+  doesSqlMutateSchema,
+} from "@/lib/sqlSchemaMutation";
+import { ChatImageGenerationStrip } from "./ChatImageGenerationStrip";
+import { SuggestedPromptsStrip } from "./SuggestedPromptsStrip";
+import { selectSuggestedPrompts } from "@/lib/suggestedPrompts";
+import { DEFAULT_ENABLE_SUGGESTED_PROMPTS } from "@/shared/settings_defaults";
+import { dismissedImageGenerationJobIdsAtom } from "@/atoms/imageGenerationAtoms";
+import { useChatImageGenerationJobs } from "@/image_generation/hooks";
+import { ImageGeneratorDialog } from "@/components/ImageGeneratorDialog";
+import { useChatModeToggle } from "@/hooks/useChatModeToggle";
+import { VisualEditingChangesDialog } from "@/components/preview_panel/VisualEditingChangesDialog";
+import { useUserBudgetInfo } from "@/hooks/useUserBudgetInfo";
+import { useQueryClient } from "@tanstack/react-query";
+import { queryKeys } from "@/lib/queryKeys";
 import {
   Tooltip,
   TooltipContent,
-  TooltipProvider,
   TooltipTrigger,
-} from "../ui/tooltip";
-import { useNavigate } from "@tanstack/react-router";
-import { useVersions } from "@/hooks/useVersions";
-import { useAttachments } from "@/hooks/useAttachments";
-import { AttachmentsList } from "./AttachmentsList";
-import { DragDropOverlay } from "./DragDropOverlay";
-import { FileAttachmentDropdown } from "./FileAttachmentDropdown";
-import { showError, showExtraFilesToast } from "@/lib/toast";
-import { ChatInputControls } from "../ChatInputControls";
-import { ChatErrorBox } from "./ChatErrorBox";
-import { selectedComponentPreviewAtom } from "@/atoms/previewAtoms";
-import { SelectedComponentDisplay } from "./SelectedComponentDisplay";
-import { useCheckProblems } from "@/hooks/useCheckProblems";
+} from "@/components/ui/tooltip";
+import {
+  ContextLimitBanner,
+  shouldShowContextLimitBanner,
+} from "./ContextLimitBanner";
+import { PromoMessage, usePromoMessage } from "./PromoMessage";
+import { useCountTokens } from "@/hooks/useCountTokens";
+import { useChats } from "@/hooks/useChats";
+import { useRouter } from "@tanstack/react-router";
+import { showError as showErrorToast } from "@/lib/toast";
+import { cn } from "@/lib/utils";
+import { useVoiceToText } from "@/hooks/useVoiceToText";
+import { isDyadProEnabled, isLocalAgentBackedMode } from "@/lib/schemas";
+import { isFreeProModel } from "@/lib/freeProModel";
+import { ReferencedAppsBar } from "./ReferencedAppsBar";
+import { useChatMode } from "@/hooks/useChatMode";
+import { useOpenPreviewIfSetupRequired } from "@/hooks/useOpenPreviewIfSetupRequired";
+import { getUserInputReadModel } from "@/user_input/read_model";
+import { usePendingToolConsents } from "@/user_input/hooks";
+import type { PendingToolConsent } from "@/user_input/selectors";
+import { useSendPreviewIframeEvent } from "@/preview_iframe/usePreviewIframe";
+import {
+  CHAT_PROMPT_LENGTH_LIMIT_MESSAGE,
+  MAX_CHAT_PROMPT_CHARS,
+} from "@/shared/chatAttachmentLimits";
+import { ChatAnnotationsTray } from "./ChatAnnotationsTray";
+import {
+  composeChatPrompt,
+  hasChatComposerPayload,
+} from "@/lib/serializeChatAnnotations";
 
 const showTokenBarAtom = atom(false);
 
 export function ChatInput({ chatId }: { chatId?: number }) {
+  const { t } = useTranslation("chat");
   const posthog = usePostHog();
-  const [inputValue, setInputValue] = useAtom(chatInputValueAtom);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const inputValuesById = useAtomValue(chatInputValuesByIdAtom);
+  const setInputValuesById = useSetAtom(chatInputValuesByIdAtom);
+  const inputValue = chatId ? (inputValuesById.get(chatId) ?? "") : "";
+  const setInputValue = useCallback(
+    (newValue: string | ((prev: string) => string)) => {
+      if (!chatId) return;
+
+      setInputValuesById((currentMap) => {
+        const prev = currentMap.get(chatId) ?? "";
+        const next = typeof newValue === "function" ? newValue(prev) : newValue;
+        const newMap = new Map(currentMap);
+        newMap.set(chatId, next);
+        return newMap;
+      });
+    },
+    [chatId, setInputValuesById],
+  );
+  const [allChatAnnotations, setAllChatAnnotations] =
+    useAtom(chatAnnotationsAtom);
+  const chatAnnotations = useMemo(
+    () => (chatId ? (allChatAnnotations.get(chatId) ?? []) : []),
+    [allChatAnnotations, chatId],
+  );
   const { settings } = useSettings();
+  const {
+    chat: activeChat,
+    selectedMode: chatMode,
+    selectedMode,
+    storedChatMode,
+    selectedModel,
+    isLoading: isChatModeLoading,
+    setChatMode,
+  } = useChatMode(chatId);
   const appId = useAtomValue(selectedAppIdAtom);
+  const { mediaApps } = useAppMediaFiles();
+  const { apps } = useLoadApps();
   const { refreshVersions } = useVersions(appId);
-  const { streamMessage, isStreaming, setIsStreaming, error, setError } =
-    useStreamChat();
+  const openPreviewIfSetupRequired = useOpenPreviewIfSetupRequired();
+  const {
+    streamMessage,
+    cancelStream,
+    isStreaming,
+    isCancellationSettling,
+    error,
+    setError,
+    queuedMessages,
+    queueMessage,
+    updateQueuedMessage,
+    removeQueuedMessage,
+    reorderQueuedMessages,
+    isPaused,
+    pauseQueue,
+    clearPauseOnly,
+    resumeQueue,
+  } = useStreamChat();
+  const { isCancellationRequested, requestCancellation } =
+    useCancellationRequestLatch({
+      chatId,
+      isStreaming,
+      isCancellationSettling,
+    });
   const [showError, setShowError] = useState(true);
   const [isApproving, setIsApproving] = useState(false); // State for approving
   const [isRejecting, setIsRejecting] = useState(false); // State for rejecting
-  const [, setMessages] = useAtom<Message[]>(chatMessagesAtom);
+  const [editingQueuedMessageId, setEditingQueuedMessageId] = useState<
+    string | null
+  >(null);
+  const isAwaitingTurnAcceptanceRef = useRef(false);
+  const messages = useChatMessages(chatId);
+  const setMessagesById = useSetAtom(chatMessagesByIdAtom);
   const setIsPreviewOpen = useSetAtom(isPreviewOpenAtom);
   const [showTokenBar, setShowTokenBar] = useAtom(showTokenBarAtom);
-  const [selectedComponent, setSelectedComponent] = useAtom(
-    selectedComponentPreviewAtom,
+  const queryClient = useQueryClient();
+  const toggleShowTokenBar = useCallback(() => {
+    setShowTokenBar((prev) => !prev);
+    queryClient.invalidateQueries({ queryKey: queryKeys.tokenCount.all });
+  }, [setShowTokenBar, queryClient]);
+  const [selectedComponents, setSelectedComponents] = useAtom(
+    selectedComponentsPreviewAtom,
   );
-  const { checkProblems } = useCheckProblems(appId);
+  const previewIframeRef = useAtomValue(previewIframeRefAtom);
+  const setVisualEditingSelectedComponent = useSetAtom(
+    visualEditingSelectedComponentAtom,
+  );
+  const setCurrentComponentCoordinates = useSetAtom(
+    currentComponentCoordinatesAtom,
+  );
+  const setPendingVisualChanges = useSetAtom(pendingVisualChangesAtom);
+  const sendPreviewIframeEvent = useSendPreviewIframeEvent(appId);
+  const store = useStore();
+  const userInputReadModel = getUserInputReadModel({ store });
+  const consentsForThisChat = usePendingToolConsents(chatId);
+  const pendingToolConsent = consentsForThisChat[0] ?? null;
+
+  // The read-model adapter owns optimistic hiding, rollback, and stale-request
+  // reconciliation so the request snapshot retains exactly one owner.
+  const decideConsent = async (
+    consent: PendingToolConsent,
+    decision: "accept-once" | "accept-always" | "decline",
+  ) => {
+    await userInputReadModel.respond(consent.requestId, {
+      kind: consent.kind === "mcp" ? "mcp-consent" : "agent-consent",
+      decision,
+    });
+  };
+
+  // Get todos for this chat
+  const agentTodosByChatId = useAtomValue(agentTodosByChatIdAtom);
+  const chatTodos = chatId ? (agentTodosByChatId.get(chatId) ?? []) : [];
+  const { refreshAppIframe } = useRunApp();
+  const { navigate } = useRouter();
+  const setSelectedChatId = useSetAtom(selectedChatIdAtom);
+  const { invalidateChats } = useChats(appId);
+  const [imageGeneratorOpen, setImageGeneratorOpen] = useState(false);
+  const handleOpenImageGenerator = useCallback(() => {
+    setImageGeneratorOpen(true);
+  }, []);
+
+  // Image generation jobs for auto-adding to chat on send
+  const chatImageJobs = useChatImageGenerationJobs();
+  const [dismissedImageJobIds, setDismissedImageJobIds] = useAtom(
+    dismissedImageGenerationJobIdsAtom,
+  );
+  const visibleSuccessfulImageJobs = useMemo(() => {
+    const appJobs = appId
+      ? chatImageJobs.filter((job) => job.targetAppId === appId)
+      : chatImageJobs;
+    return appJobs.filter(
+      (job) =>
+        !dismissedImageJobIds.has(job.id) &&
+        job.status === "success" &&
+        job.result,
+    );
+  }, [chatImageJobs, dismissedImageJobIds, appId]);
+  const hasSuccessfulImageJobs = visibleSuccessfulImageJobs.length > 0;
+  const hasPendingImageJobs = chatImageJobs.some(
+    (job) =>
+      (!appId || job.targetAppId === appId) &&
+      !dismissedImageJobIds.has(job.id) &&
+      // A cancelling job can still finish and be attached to the next message.
+      (job.status === "pending" || job.status === "cancelling"),
+  );
+
   // Use the attachments hook
   const {
     attachments,
     isDraggingOver,
+    pendingFiles,
     handleFileSelect,
     removeAttachment,
     handleDragOver,
     handleDragLeave,
     handleDrop,
     clearAttachments,
+    clearSubmittedAttachments,
+    restoreSubmittedAttachments,
+    replaceAttachments,
     handlePaste,
-  } = useAttachments();
+    confirmPendingFiles,
+    cancelPendingFiles,
+  } = useAttachments(chatId);
 
   // Use the hook to fetch the proposal
   const {
@@ -105,21 +307,67 @@ export function ChatInput({ chatId }: { chatId?: number }) {
     isLoading: isProposalLoading,
     error: proposalError,
     refreshProposal,
-  } = useProposal(chatId);
+  } = useProposal(chatId, { isStreaming });
   const { proposal, messageId } = proposalResult ?? {};
+  useChatModeToggle();
 
-  const adjustHeight = () => {
-    const textarea = textareaRef.current;
-    if (textarea) {
-      textarea.style.height = "0px";
-      const scrollHeight = textarea.scrollHeight;
-      textarea.style.height = `${scrollHeight + 4}px`;
-    }
-  };
+  const lastMessage = messages.at(-1);
+  const disableSendButton =
+    lastMessage?.role === "assistant" &&
+    !lastMessage.approvalState &&
+    !!proposal &&
+    proposal.type === "code-proposal" &&
+    messageId === lastMessage.id;
+  const hasComposerPayload = hasChatComposerPayload({
+    inputValue,
+    attachmentCount: attachments.length,
+    hasSuccessfulImageJobs,
+    annotationCount: chatAnnotations.length,
+  });
 
-  useEffect(() => {
-    adjustHeight();
-  }, [inputValue]);
+  // Extract user message history for terminal-style navigation
+  const userMessageHistory = useMemo(() => {
+    return messages
+      .filter((msg) => msg.role === "user")
+      .map((msg) => msg.content)
+      .reverse(); // Most recent first
+  }, [messages]);
+
+  const { userBudget } = useUserBudgetInfo();
+  const isProEnabled = settings ? isDyadProEnabled(settings) : false;
+
+  const handleTranscription = useCallback(
+    (text: string) => {
+      setInputValue((prev: string) => (prev.trim() ? prev + " " + text : text));
+    },
+    [setInputValue],
+  );
+
+  const { isRecording, isTranscribing, isVoiceBusy, toggleRecording } =
+    useVoiceToText({
+      enabled: isProEnabled,
+      onTranscription: handleTranscription,
+      onError: (message) => showErrorToast(message),
+    });
+
+  // Token counting for context limit banner
+  const { result: tokenCountResult } = useCountTokens(
+    !isStreaming ? (chatId ?? null) : null,
+    "",
+  );
+
+  const showBanner =
+    !isStreaming &&
+    tokenCountResult &&
+    shouldShowContextLimitBanner({
+      totalTokens: tokenCountResult.actualMaxTokens,
+      contextWindow: tokenCountResult.contextWindow,
+    });
+
+  // Promo cap row on the composer; never stack two caps — the context limit
+  // warning wins the slot.
+  const promo = usePromoMessage(chatId);
+  const showPromo = promo.visible && !showBanner;
 
   useEffect(() => {
     if (error) {
@@ -129,54 +377,499 @@ export function ChatInput({ chatId }: { chatId?: number }) {
 
   const fetchChatMessages = useCallback(async () => {
     if (!chatId) {
-      setMessages([]);
       return;
     }
-    const chat = await IpcClient.getInstance().getChat(chatId);
-    setMessages(chat.messages);
-  }, [chatId, setMessages]);
+    const chat = await ipc.chat.getChat(chatId);
+    setMessagesById((prev) => {
+      const next = new Map(prev);
+      next.set(chatId, chat.messages);
+      return next;
+    });
+  }, [chatId, setMessagesById]);
 
-  const handleKeyPress = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      handleSubmit();
+  // Shared cleanup run after a submit consumes the composer's contents: clears
+  // the input, any selected/visual-editing components, and the preview overlay.
+  // Attachments are cleared separately because their timing varies by path
+  // (they must be handed to stream/queue first, then cleared).
+  const clearComposerAfterSubmit = useCallback(() => {
+    setInputValue("");
+    setSelectedComponents([]);
+    sendPreviewIframeEvent({ type: "PICKER_DEACTIVATED" });
+    setVisualEditingSelectedComponent(null);
+    // Clear overlays in the preview iframe
+    if (previewIframeRef?.contentWindow) {
+      previewIframeRef.contentWindow.postMessage(
+        { type: "clear-dyad-component-overlays" },
+        "*",
+      );
     }
-  };
+  }, [
+    setInputValue,
+    setSelectedComponents,
+    sendPreviewIframeEvent,
+    setVisualEditingSelectedComponent,
+    previewIframeRef,
+  ]);
+
+  // Shared cleanup for exiting queued message editing state
+  const resetEditingState = useCallback(() => {
+    setEditingQueuedMessageId(null);
+    clearComposerAfterSubmit();
+    clearAttachments();
+  }, [setEditingQueuedMessageId, clearComposerAfterSubmit, clearAttachments]);
+
+  // Clear editing state if the edited queued message is auto-dequeued
+  useEffect(() => {
+    if (!editingQueuedMessageId) return;
+    const stillInQueue = queuedMessages.some(
+      (m) => m.id === editingQueuedMessageId,
+    );
+    if (!stillInQueue) {
+      resetEditingState();
+    }
+  }, [editingQueuedMessageId, queuedMessages, resetEditingState]);
+
+  // Track editing state in a ref for unmount cleanup
+  const editingQueuedMessageIdRef = useRef(editingQueuedMessageId);
+  editingQueuedMessageIdRef.current = editingQueuedMessageId;
+
+  // Clear editing extras on unmount to avoid leaking state across navigations
+  useEffect(() => {
+    return () => {
+      if (editingQueuedMessageIdRef.current) {
+        clearAttachments();
+        setSelectedComponents([]);
+        setVisualEditingSelectedComponent(null);
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Auto-clear pause state when queue becomes empty (Users expect that deleting
+  // all queued messages returns them to normal send mode). Keep the
+  // authoritative Stop policy until cancellation settles so a late submission
+  // admitted by the stream machine cannot land in an unpaused queue.
+
+  useEffect(() => {
+    if (
+      chatId &&
+      isPaused &&
+      queuedMessages.length === 0 &&
+      !isCancellationRequested
+    ) {
+      clearPauseOnly();
+    }
+  }, [
+    chatId,
+    isPaused,
+    queuedMessages.length,
+    isCancellationRequested,
+    clearPauseOnly,
+  ]);
+
+  // Queue management handlers
+  const handleEditQueuedMessage = useCallback(
+    (id: string) => {
+      const msg = queuedMessages.find((m) => m.id === id);
+      if (!msg) return;
+      // Auto-save current edits if switching between queued messages
+      if (editingQueuedMessageId && editingQueuedMessageId !== id) {
+        const componentsToSave =
+          selectedComponents && selectedComponents.length > 0
+            ? selectedComponents
+            : [];
+        updateQueuedMessage(editingQueuedMessageId, {
+          prompt: inputValue,
+          attachments,
+          selectedComponents: componentsToSave,
+        });
+      }
+      // Load the message content into the input
+      setInputValue(msg.prompt);
+      // Restore attachments and selected components from the queued message
+      replaceAttachments(msg.attachments ?? []);
+      setSelectedComponents(msg.selectedComponents ?? []);
+      sendPreviewIframeEvent({ type: "SELECTION_RESTORE_QUEUED" });
+      // Reset visual editing target to avoid stale toolbar state
+      setVisualEditingSelectedComponent(null);
+      // Set editing mode
+      setEditingQueuedMessageId(id);
+    },
+    [
+      queuedMessages,
+      editingQueuedMessageId,
+      inputValue,
+      attachments,
+      selectedComponents,
+      setInputValue,
+      replaceAttachments,
+      setSelectedComponents,
+      setVisualEditingSelectedComponent,
+      sendPreviewIframeEvent,
+      updateQueuedMessage,
+    ],
+  );
+
+  const handleMoveUp = useCallback(
+    (id: string) => {
+      const index = queuedMessages.findIndex((m) => m.id === id);
+      if (index > 0) {
+        reorderQueuedMessages(index, index - 1);
+      }
+    },
+    [queuedMessages, reorderQueuedMessages],
+  );
+
+  const handleMoveDown = useCallback(
+    (id: string) => {
+      const index = queuedMessages.findIndex((m) => m.id === id);
+      if (index >= 0 && index < queuedMessages.length - 1) {
+        reorderQueuedMessages(index, index + 1);
+      }
+    },
+    [queuedMessages, reorderQueuedMessages],
+  );
+
+  const handleDeleteQueuedMessage = useCallback(
+    (id: string) => {
+      // Clear editing state if deleting the message being edited
+      if (editingQueuedMessageId === id) {
+        resetEditingState();
+      }
+      return removeQueuedMessage(id);
+    },
+    [editingQueuedMessageId, removeQueuedMessage, resetEditingState],
+  );
 
   const handleSubmit = async () => {
     if (
-      (!inputValue.trim() && attachments.length === 0) ||
-      isStreaming ||
-      !chatId
+      !hasComposerPayload ||
+      !chatId ||
+      pendingFiles ||
+      isAwaitingTurnAcceptanceRef.current
     ) {
       return;
     }
 
-    const currentInput = inputValue;
-    setInputValue("");
-    setSelectedComponent(null);
+    const submittedAnnotations = chatAnnotations;
+    const submittedAnnotationIds = new Set(
+      submittedAnnotations.map((annotation) => annotation.id),
+    );
+    const hideSubmittedAnnotations = () => {
+      if (submittedAnnotationIds.size === 0) return;
+      setAllChatAnnotations((previous) => {
+        const next = new Map(previous);
+        const remaining = (next.get(chatId) ?? []).filter(
+          (annotation) => !submittedAnnotationIds.has(annotation.id),
+        );
+        if (remaining.length === 0) next.delete(chatId);
+        else next.set(chatId, remaining);
+        return next;
+      });
+    };
+    let restoredSubmittedAnnotations = false;
+    const restoreSubmittedAnnotations = () => {
+      if (submittedAnnotations.length === 0 || restoredSubmittedAnnotations) {
+        return;
+      }
+      restoredSubmittedAnnotations = true;
+      setAllChatAnnotations((previous) => {
+        const current = previous.get(chatId) ?? [];
+        const currentIds = new Set(current.map((annotation) => annotation.id));
+        const missing = submittedAnnotations.filter(
+          (annotation) => !currentIds.has(annotation.id),
+        );
+        if (missing.length === 0) return previous;
+        const next = new Map(previous);
+        next.set(
+          chatId,
+          [...missing, ...current].sort(
+            (left, right) => left.createdAt - right.createdAt,
+          ),
+        );
+        return next;
+      });
+    };
 
-    // Send message with attachments and clear them after sending
+    if (isRecording) {
+      await toggleRecording();
+    }
+
+    // Build prompt with auto-added image mentions
+    const imageMentions = visibleSuccessfulImageJobs
+      .map((job) => `@media:${encodeURIComponent(job.result!.fileName)}`)
+      .join(" ");
+    const promptWithImages = inputValue.trim()
+      ? imageMentions
+        ? `${inputValue} ${imageMentions}`
+        : inputValue
+      : imageMentions;
+    const currentInput = composeChatPrompt(
+      promptWithImages,
+      submittedAnnotations,
+    );
+
+    if (currentInput.length > MAX_CHAT_PROMPT_CHARS) {
+      showErrorToast(CHAT_PROMPT_LENGTH_LIMIT_MESSAGE);
+      return;
+    }
+
+    const submittedInputValue = inputValue;
+    const submittedImageJobIds = visibleSuccessfulImageJobs.map(
+      (job) => job.id,
+    );
+    const dismissSubmittedImageJobs = () => {
+      if (submittedImageJobIds.length === 0) return;
+      setDismissedImageJobIds((previous) => {
+        const next = new Set(previous);
+        for (const jobId of submittedImageJobIds) next.add(jobId);
+        return next;
+      });
+    };
+
+    // Use all selected components for multi-component editing
+    const componentsToSend =
+      selectedComponents && selectedComponents.length > 0
+        ? selectedComponents
+        : [];
+
+    // Handle editing a queued message
+    if (editingQueuedMessageId) {
+      updateQueuedMessage(editingQueuedMessageId, {
+        prompt: currentInput,
+        attachments,
+        selectedComponents: componentsToSend,
+      });
+      hideSubmittedAnnotations();
+      dismissSubmittedImageJobs();
+      resetEditingState();
+      return;
+    }
+
+    // Queue while actively streaming. When Stop parked the queue but the actor
+    // is idle, the main actor appends this prompt and resumes FIFO. Explicit
+    // Pause and step-limit pauses instead let this new turn run immediately.
+    if (isStreaming) {
+      const queued = queueMessage({
+        prompt: currentInput,
+        attachments,
+        selectedComponents: componentsToSend,
+      });
+      if (queued) {
+        // Only clear input, attachments, and components on successful queue
+        hideSubmittedAnnotations();
+        clearComposerAfterSubmit();
+        clearAttachments();
+        dismissSubmittedImageJobs();
+      }
+      // If queue failed, leave input/attachments intact for the user
+      return;
+    }
+
+    // Clear text immediately, even when admission waits on network preflight.
+    // Keep the submitted draft in this request's closure so rejection can
+    // restore it without discarding anything typed while admission was pending.
+    void openPreviewIfSetupRequired(appId);
+    setInputValue("");
+    clearSubmittedAttachments(attachments);
+    dismissSubmittedImageJobs();
+    let didRestoreSubmittedInput = false;
+    const restoreSubmittedInput = () => {
+      if (didRestoreSubmittedInput) return;
+      didRestoreSubmittedInput = true;
+      restoreSubmittedAttachments(attachments);
+      setDismissedImageJobIds((previous) => {
+        const next = new Set(previous);
+        for (const jobId of submittedImageJobIds) next.delete(jobId);
+        return next;
+      });
+      setInputValue((current) =>
+        current && submittedInputValue
+          ? `${submittedInputValue}\n\n${current}`
+          : submittedInputValue || current,
+      );
+    };
+    let didClearAcceptedPayload = false;
+    const clearAcceptedPayload = () => {
+      if (didClearAcceptedPayload) return;
+      didClearAcceptedPayload = true;
+      const currentComponents = store.get(selectedComponentsPreviewAtom);
+      if (
+        currentComponents.length === componentsToSend.length &&
+        currentComponents.every(
+          (component, index) => component === componentsToSend[index],
+        )
+      ) {
+        setSelectedComponents([]);
+        sendPreviewIframeEvent({ type: "PICKER_DEACTIVATED" });
+        setVisualEditingSelectedComponent(null);
+        if (previewIframeRef?.contentWindow) {
+          previewIframeRef.contentWindow.postMessage(
+            { type: "clear-dyad-component-overlays" },
+            "*",
+          );
+        }
+      }
+    };
+    isAwaitingTurnAcceptanceRef.current = true;
+    hideSubmittedAnnotations();
+    let wasAccepted = false;
     await streamMessage({
       prompt: currentInput,
       chatId,
       attachments,
       redo: false,
-      selectedComponent,
+      showOptimisticMessage: true,
+      optimisticDisplayContent: buildOptimisticChatDisplay(
+        currentInput,
+        apps.find((app) => app.id === appId)?.path,
+        [
+          ...(mediaApps.find((app) => app.appId === appId)?.files ?? []),
+          ...visibleSuccessfulImageJobs.map((job) => ({
+            fileName: job.result!.fileName,
+            mimeType: "image/png",
+          })),
+        ],
+      ),
+      selectedComponents: componentsToSend,
+      requestedChatMode: isChatModeLoading ? null : storedChatMode,
+      onAccepted: () => {
+        wasAccepted = true;
+        isAwaitingTurnAcceptanceRef.current = false;
+        clearAcceptedPayload();
+      },
+      onAcceptanceRejected: () => {
+        isAwaitingTurnAcceptanceRef.current = false;
+        restoreSubmittedInput();
+        restoreSubmittedAnnotations();
+      },
+      onSettled: ({ success, queued }) => {
+        isAwaitingTurnAcceptanceRef.current = false;
+        if (queued) clearAcceptedPayload();
+        if (!success && !queued && !wasAccepted) {
+          restoreSubmittedInput();
+          restoreSubmittedAnnotations();
+        }
+      },
     });
-    clearAttachments();
-    posthog.capture("chat:submit");
+    posthog.capture("chat:submit", { chatMode });
   };
 
   const handleCancel = () => {
-    if (chatId) {
-      IpcClient.getInstance().cancelChatStream(chatId);
+    // A ref-backed optimistic latch closes the same-render double-click window
+    // before the stream actor's cancelling projection reaches React.
+    if (!requestCancellation()) return;
+    // Stopping is non-destructive: queued prompts are parked, never deleted.
+    // `isPaused` is a transient latch (resuming, an emptied queue, or a
+    // step-limit continue all clear it), so it can be false while the user
+    // still has prompts they care about queued — deleting them here silently
+    // lost work, including the queue restored (paused) after a restart.
+    //
+    // The cancel intent also tells the authoritative actor to park the queue.
+    // Keeping those actions in one actor transition prevents queue revision
+    // races while still parking follow-ups admitted during cancellation.
+    // Always reset editing state when cancelling, regardless of pause state
+    if (editingQueuedMessageId) {
+      resetEditingState();
     }
-    setIsStreaming(false);
+    if (chatId) {
+      // The stream machine reconciles the cancel with the real terminal
+      // event (including cancels fired before main registered the stream).
+      cancelStream();
+    }
   };
 
   const dismissError = () => {
     setShowError(false);
+  };
+
+  // Follow-up prompts the model attached to its last reply. Hidden while a
+  // pending consent or unapproved proposal still owns the composer's attention,
+  // and entirely when the user has turned the setting off.
+  const suggestedPromptsEnabled =
+    settings?.enableSuggestedPrompts ?? DEFAULT_ENABLE_SUGGESTED_PROMPTS;
+  const suggestedPrompts = useMemo(
+    () =>
+      suggestedPromptsEnabled
+        ? selectSuggestedPrompts({
+            messages,
+            isStreaming,
+            hasError: !!error,
+            composerHasContent:
+              hasComposerPayload ||
+              selectedComponents.length > 0 ||
+              !!pendingFiles ||
+              hasPendingImageJobs ||
+              isVoiceBusy,
+          })
+        : null,
+    [
+      suggestedPromptsEnabled,
+      messages,
+      isStreaming,
+      error,
+      hasComposerPayload,
+      selectedComponents,
+      pendingFiles,
+      hasPendingImageJobs,
+      isVoiceBusy,
+    ],
+  );
+  const handleSelectSuggestedPrompt = useCallback(
+    (prompt: string) => {
+      if (!chatId || isStreaming || isAwaitingTurnAcceptanceRef.current) {
+        return;
+      }
+      // Same latch as handleSubmit, so a second click before the optimistic
+      // user message renders cannot queue a duplicate turn.
+      isAwaitingTurnAcceptanceRef.current = true;
+      const releaseLatch = () => {
+        isAwaitingTurnAcceptanceRef.current = false;
+      };
+      void openPreviewIfSetupRequired(appId);
+      void streamMessage({
+        prompt,
+        chatId,
+        redo: false,
+        showOptimisticMessage: true,
+        requestedChatMode: isChatModeLoading ? null : storedChatMode,
+        onAccepted: releaseLatch,
+        onAcceptanceRejected: releaseLatch,
+        onSettled: releaseLatch,
+      });
+      posthog.capture("chat:submit", { chatMode, source: "suggested_prompt" });
+    },
+    [
+      chatId,
+      isStreaming,
+      appId,
+      openPreviewIfSetupRequired,
+      streamMessage,
+      isChatModeLoading,
+      storedChatMode,
+      posthog,
+      chatMode,
+    ],
+  );
+
+  const handleNewChat = async () => {
+    if (appId) {
+      try {
+        const newChatId = await ipc.chat.createChat({ appId });
+        setSelectedChatId(newChatId);
+        navigate({
+          to: "/chat",
+          search: { id: newChatId },
+        });
+        await invalidateChats();
+      } catch (err) {
+        showErrorToast(
+          `Failed to create new chat: ${(err as Error).toString()}`,
+        );
+      }
+    } else {
+      navigate({ to: "/" });
+    }
   };
 
   const handleApprove = async () => {
@@ -188,7 +881,7 @@ export function ChatInput({ chatId }: { chatId?: number }) {
     setIsApproving(true);
     posthog.capture("chat:approve");
     try {
-      const result = await IpcClient.getInstance().approveProposal({
+      const result = await ipc.proposal.approveProposal({
         chatId,
         messageId,
       });
@@ -199,16 +892,21 @@ export function ChatInput({ chatId }: { chatId?: number }) {
           posthog,
         });
       }
+      for (const warningMessage of result.warningMessages ?? []) {
+        showWarning(warningMessage);
+      }
+      if (!result.success) {
+        setError(result.error ?? "An error occurred while approving");
+      }
     } catch (err) {
       console.error("Error approving proposal:", err);
       setError((err as Error)?.message || "An error occurred while approving");
     } finally {
       setIsApproving(false);
-      setIsPreviewOpen(true);
-      refreshVersions();
-      if (settings?.enableAutoFixProblems) {
-        checkProblems();
+      if (settings?.autoExpandPreviewPanel) {
+        setIsPreviewOpen(true);
       }
+      refreshVersions();
 
       // Keep same as handleReject
       refreshProposal();
@@ -225,7 +923,7 @@ export function ChatInput({ chatId }: { chatId?: number }) {
     setIsRejecting(true);
     posthog.capture("chat:reject");
     try {
-      await IpcClient.getInstance().rejectProposal({
+      await ipc.proposal.rejectProposal({
         chatId,
         messageId,
       });
@@ -234,7 +932,6 @@ export function ChatInput({ chatId }: { chatId?: number }) {
       setError((err as Error)?.message || "An error occurred while rejecting");
     } finally {
       setIsRejecting(false);
-
       // Keep same as handleApprove
       refreshProposal();
       fetchChatMessages();
@@ -251,33 +948,114 @@ export function ChatInput({ chatId }: { chatId?: number }) {
         <ChatErrorBox
           onDismiss={dismissError}
           error={error}
-          isDyadProEnabled={settings.enableDyadPro ?? false}
+          isDyadProEnabled={isProEnabled}
+          onStartNewChat={handleNewChat}
+          onSwitchToBuildMode={
+            isFreeProModel(selectedModel)
+              ? undefined
+              : () => {
+                  void setChatMode("build")
+                    .then(dismissError)
+                    .catch(() => {});
+                }
+          }
         />
       )}
       {/* Display loading or error state for proposal */}
       {isProposalLoading && (
         <div className="p-4 text-sm text-muted-foreground">
-          Loading proposal...
+          {t("loadingProposal")}
         </div>
       )}
       {proposalError && (
         <div className="p-4 text-sm text-red-600">
-          Error loading proposal: {proposalError}
+          {t("errorLoadingProposal", { message: proposalError.message })}
         </div>
       )}
-      <div className="p-4" data-testid="chat-input-container">
+      <div className="p-2 pt-0" data-testid="chat-input-container">
+        {/* Promo cap row fused to the top of the composer */}
+        {showPromo && <PromoMessage seed={promo.seed} />}
+        {/* Show context limit banner above chat input for visibility */}
+        {showBanner && tokenCountResult && (
+          <ContextLimitBanner
+            totalTokens={tokenCountResult.actualMaxTokens}
+            contextWindow={tokenCountResult.contextWindow}
+          />
+        )}
+        {/* Cancelling a turn can take a minute when the agent is mid-tool (a
+            test run has to be killed and its isolation torn down). Pinned here
+            rather than inline in the transcript, which scrolls away. */}
+        {isCancellationRequested && (
+          <CancellationBanner appId={activeChat?.appId} />
+        )}
         <div
-          className={`relative flex flex-col border border-border rounded-lg bg-(--background-lighter) shadow-sm ${
-            isDraggingOver ? "ring-2 ring-blue-500 border-blue-500" : ""
-          }`}
+          className={cn(
+            "relative flex flex-col border border-border rounded-2xl bg-(--background-lighter) transition-colors duration-200",
+            "focus-within:border-primary/30 focus-within:ring-1 focus-within:ring-primary/20",
+            isDraggingOver && "ring-2 ring-blue-500 border-blue-500",
+            (showBanner || showPromo || isCancellationRequested) &&
+              "rounded-t-none border-t-0",
+          )}
           onDragOver={handleDragOver}
           onDragLeave={handleDragLeave}
           onDrop={handleDrop}
         >
-          {/* Only render ChatInputActions if proposal is loaded */}
-          {proposal &&
-            proposalResult?.chatId === chatId &&
-            settings.selectedChatMode !== "ask" && (
+          {/* Show active questionnaire if exists */}
+          <QuestionnaireInput />
+
+          {chatId && <ChatAnnotationsTray chatId={chatId} />}
+
+          {/* Show the recorded-test plan waiting on a review, if any */}
+          <TestAssertionsInput />
+
+          {/* Show todo list if there are todos for this chat */}
+          {chatTodos.length > 0 && <TodoList todos={chatTodos} />}
+          {/* Show consent banner if there's a pending consent request */}
+          {pendingToolConsent && (
+            <AgentConsentBanner
+              consent={pendingToolConsent}
+              queueTotal={consentsForThisChat.length}
+              onDecision={(decision) =>
+                decideConsent(pendingToolConsent, decision)
+              }
+              onClose={() => decideConsent(pendingToolConsent, "decline")}
+            />
+          )}
+          <SubscriptionLimitBanner />
+          {/* Show queued messages list */}
+          {queuedMessages.length > 0 && (
+            <QueuedMessagesList
+              messages={queuedMessages}
+              onEdit={handleEditQueuedMessage}
+              onDelete={handleDeleteQueuedMessage}
+              onMoveUp={handleMoveUp}
+              onMoveDown={handleMoveDown}
+              isStreaming={isStreaming}
+              hasError={!!error}
+              isPaused={isPaused}
+              onPauseQueue={pauseQueue}
+              onResumeQueue={resumeQueue}
+            />
+          )}
+          {/* Show editing indicator when editing a queued message */}
+          {editingQueuedMessageId && (
+            <div className="border-b border-border p-2 bg-yellow-500/10 flex items-center justify-between">
+              <span className="text-sm text-yellow-700 dark:text-yellow-400">
+                Editing queued message
+              </span>
+              <button
+                type="button"
+                onClick={() => resetEditingState()}
+                className="text-xs text-muted-foreground hover:text-foreground cursor-pointer"
+              >
+                Cancel
+              </button>
+            </div>
+          )}
+          {/* Only render ChatInputActions if proposal is loaded and no pending consent */}
+          {!pendingToolConsent &&
+            proposal &&
+            proposalResult?.chatId === chatId && (
               <ChatInputActions
                 proposal={proposal}
                 onApprove={handleApprove}
@@ -295,7 +1073,56 @@ export function ChatInput({ chatId }: { chatId?: number }) {
               />
             )}
 
-          <SelectedComponentDisplay />
+          {userBudget ? (
+            <VisualEditingChangesDialog
+              iframeRef={
+                previewIframeRef
+                  ? { current: previewIframeRef }
+                  : { current: null }
+              }
+              onReset={() => {
+                // Exit component selection mode and visual editing
+                setSelectedComponents([]);
+                sendPreviewIframeEvent({ type: "PICKER_DEACTIVATED" });
+                setVisualEditingSelectedComponent(null);
+                setCurrentComponentCoordinates(null);
+                setPendingVisualChanges(new Map());
+                refreshAppIframe();
+              }}
+            />
+          ) : (
+            selectedComponents.length > 0 && (
+              <div className="border-b border-border p-3 bg-muted/30">
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <button
+                        onClick={() => {
+                          ipc.system.openExternalUrl("https://dyad.sh/pro");
+                        }}
+                        className="flex items-center gap-2 text-sm text-muted-foreground hover:text-primary transition-colors cursor-pointer"
+                      />
+                    }
+                  >
+                    <Lock size={16} />
+                    <span className="font-medium">{t("visualEditor")}</span>
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    {t("visualEditorDescription")}
+                  </TooltipContent>
+                </Tooltip>
+              </div>
+            )
+          )}
+
+          <SelectedComponentsDisplay />
+
+          {/* Apps referenced with @app: that stay readable for this chat */}
+          <ReferencedAppsBar
+            chatId={chatId}
+            isEnabled={isLocalAgentBackedMode(selectedMode)}
+            isStreaming={isStreaming}
+          />
 
           {/* Use the AttachmentsList component */}
           <AttachmentsList
@@ -303,74 +1130,188 @@ export function ChatInput({ chatId }: { chatId?: number }) {
             onRemove={removeAttachment}
           />
 
+          {/* Chat image generation strip */}
+          <ChatImageGenerationStrip
+            onGenerateImage={handleOpenImageGenerator}
+          />
+
+          {/* Model-suggested follow-up prompts from the last reply */}
+          {chatId &&
+            suggestedPrompts &&
+            !pendingToolConsent &&
+            !disableSendButton && (
+              <SuggestedPromptsStrip
+                chatId={chatId}
+                messageId={suggestedPrompts.messageId}
+                prompts={suggestedPrompts.prompts}
+                onSelect={handleSelectSuggestedPrompt}
+              />
+            )}
+
           {/* Use the DragDropOverlay component */}
           <DragDropOverlay isDraggingOver={isDraggingOver} />
 
-          <div className="flex items-start space-x-2 ">
-            <textarea
-              ref={textareaRef}
+          {/* Dialog for choosing attachment type */}
+          <FileAttachmentTypeDialog
+            pendingFiles={pendingFiles}
+            onConfirm={confirmPendingFiles}
+            onCancel={cancelPendingFiles}
+          />
+
+          <div className="flex items-end gap-1">
+            <LexicalChatInput
               value={inputValue}
-              onChange={(e) => setInputValue(e.target.value)}
-              onKeyPress={handleKeyPress}
+              onChange={setInputValue}
+              onSubmit={handleSubmit}
               onPaste={handlePaste}
-              placeholder="Ask Dyad to build..."
-              className="flex-1 p-2 focus:outline-none overflow-y-auto min-h-[40px] max-h-[200px]"
-              style={{ resize: "none" }}
+              placeholder={t("askDyadToBuild")}
+              excludeCurrentApp={true}
+              disableSendButton={disableSendButton}
+              messageHistory={userMessageHistory}
             />
 
-            {isStreaming ? (
-              <button
-                onClick={handleCancel}
-                className="px-2 py-2 mt-1 mr-1 hover:bg-(--background-darkest) text-(--sidebar-accent-fg) rounded-lg"
-                title="Cancel generation"
-              >
-                <StopCircleIcon size={20} />
-              </button>
-            ) : (
-              <button
-                onClick={handleSubmit}
-                disabled={!inputValue.trim() && attachments.length === 0}
-                className="px-2 py-2 mt-1 mr-1 hover:bg-(--background-darkest) text-(--sidebar-accent-fg) rounded-lg disabled:opacity-50"
-                title="Send message"
-              >
-                <SendHorizontalIcon size={20} />
-              </button>
-            )}
-          </div>
-          <div className="pl-2 pr-1 flex items-center justify-between pb-2">
-            <div className="flex items-center">
-              <ChatInputControls showContextFilesPicker={true} />
-              {/* File attachment dropdown */}
-              <FileAttachmentDropdown
-                onFileSelect={handleFileSelect}
-                disabled={isStreaming}
-              />
-            </div>
-
-            <TooltipProvider>
+            {/* Voice-to-text button */}
+            {isProEnabled ? (
               <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    onClick={() => setShowTokenBar(!showTokenBar)}
-                    variant="ghost"
-                    className={`has-[>svg]:px-2 ${
-                      showTokenBar ? "text-purple-500 bg-purple-100" : ""
-                    }`}
-                    size="sm"
-                  >
-                    <ChartColumnIncreasing size={14} />
-                  </Button>
+                <TooltipTrigger
+                  render={
+                    <button
+                      onClick={toggleRecording}
+                      disabled={isTranscribing}
+                      aria-label={
+                        isRecording
+                          ? t("stopRecording", "Stop recording")
+                          : isTranscribing
+                            ? t("transcribing", "Transcribing...")
+                            : t("voiceToText", "Voice to text")
+                      }
+                      className={cn(
+                        "px-2 py-2 mb-0.5 text-muted-foreground rounded-lg transition-colors duration-150 cursor-pointer disabled:cursor-default disabled:opacity-30",
+                        isRecording &&
+                          "text-red-500 hover:text-red-600 animate-pulse",
+                        !isRecording && !isTranscribing && "hover:text-primary",
+                      )}
+                    />
+                  }
+                >
+                  {isTranscribing ? (
+                    <Loader2 size={20} className="animate-spin" />
+                  ) : isRecording ? (
+                    <MicOff size={20} />
+                  ) : (
+                    <Mic size={20} />
+                  )}
                 </TooltipTrigger>
                 <TooltipContent>
-                  {showTokenBar ? "Hide token usage" : "Show token usage"}
+                  {isRecording
+                    ? t("stopRecording", "Stop recording")
+                    : isTranscribing
+                      ? t("transcribing", "Transcribing...")
+                      : t("voiceToText", "Voice to text")}
                 </TooltipContent>
               </Tooltip>
-            </TooltipProvider>
+            ) : (
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <button
+                      onClick={() =>
+                        ipc.system.openExternalUrl("https://dyad.sh/pro")
+                      }
+                      aria-label={t("voiceToTextPro", "Voice to text (Pro)")}
+                      className="px-2 py-2 mb-0.5 text-muted-foreground hover:text-primary rounded-lg transition-colors duration-150 cursor-pointer relative"
+                    />
+                  }
+                >
+                  <Mic size={20} />
+                  <Lock size={10} className="absolute -top-0.5 -right-0.5" />
+                </TooltipTrigger>
+                <TooltipContent>
+                  {t("voiceToTextRequiresPro", "Voice to text (requires Pro)")}
+                </TooltipContent>
+              </Tooltip>
+            )}
+
+            {isStreaming ? (
+              // Cancelling is not instant — an in-flight tool has to unwind
+              // first. Confirm the click here (the banner above carries the
+              // reason) and refuse a second one, which would only re-abort an
+              // already-aborted controller.
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <button
+                      onClick={handleCancel}
+                      disabled={isCancellationRequested}
+                      aria-label={
+                        isCancellationRequested
+                          ? t("stoppingGeneration", "Stopping…")
+                          : t("cancelGeneration")
+                      }
+                      className={cn(
+                        "px-2 py-2 mb-0.5 mr-1 rounded-lg transition-colors duration-150",
+                        isCancellationRequested
+                          ? "text-amber-600 dark:text-amber-500 cursor-default"
+                          : "text-muted-foreground hover:text-destructive cursor-pointer",
+                      )}
+                    />
+                  }
+                >
+                  {isCancellationRequested ? (
+                    <Loader2 size={20} className="animate-spin" />
+                  ) : (
+                    <StopCircleIcon size={20} />
+                  )}
+                </TooltipTrigger>
+                <TooltipContent>
+                  {isCancellationRequested
+                    ? t("stoppingGeneration", "Stopping…")
+                    : t("cancelGeneration")}
+                </TooltipContent>
+              </Tooltip>
+            ) : (
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <button
+                      onClick={handleSubmit}
+                      disabled={!hasComposerPayload || disableSendButton}
+                      aria-label={t("sendMessage")}
+                      className="px-2 py-2 mb-0.5 mr-1 text-muted-foreground hover:text-primary rounded-lg transition-colors duration-150 disabled:opacity-30 disabled:hover:text-muted-foreground cursor-pointer disabled:cursor-default"
+                    />
+                  }
+                >
+                  <SendHorizontalIcon size={20} />
+                </TooltipTrigger>
+                <TooltipContent>{t("sendMessage")}</TooltipContent>
+              </Tooltip>
+            )}
+          </div>
+          <div className="px-2 flex items-center justify-between pb-0.5 pt-0.5">
+            <div className="flex items-center">
+              <ChatInputControls />
+            </div>
+
+            <AuxiliaryActionsMenu
+              onFileSelect={handleFileSelect}
+              showTokenBar={showTokenBar}
+              toggleShowTokenBar={toggleShowTokenBar}
+              appId={appId ?? undefined}
+              onGenerateImage={handleOpenImageGenerator}
+            />
           </div>
           {/* TokenBar is only displayed when showTokenBar is true */}
           {showTokenBar && <TokenBar chatId={chatId} />}
         </div>
       </div>
+
+      {/* Image Generator Dialog */}
+      <ImageGeneratorDialog
+        open={imageGeneratorOpen}
+        onOpenChange={setImageGeneratorOpen}
+        defaultAppId={appId ?? undefined}
+        source="chat"
+      />
     </>
   );
 }
@@ -382,61 +1323,47 @@ function SuggestionButton({
 }: {
   onClick: () => void;
   children: React.ReactNode;
-  tooltipText: string;
+  tooltipText: string | string[];
 }) {
   const { isStreaming } = useStreamChat();
   return (
-    <TooltipProvider>
-      <Tooltip>
-        <TooltipTrigger asChild>
+    <Tooltip>
+      <TooltipTrigger
+        render={
           <Button
             disabled={isStreaming}
             variant="outline"
             size="sm"
             onClick={onClick}
-          >
-            {children}
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent>{tooltipText}</TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
+          />
+        }
+      >
+        {children}
+      </TooltipTrigger>
+      <TooltipContent>
+        {Array.isArray(tooltipText)
+          ? tooltipText.map((line) => <div key={line}>{line}</div>)
+          : tooltipText}
+      </TooltipContent>
+    </Tooltip>
   );
 }
 
 function SummarizeInNewChatButton() {
-  const chatId = useAtomValue(selectedChatIdAtom);
-  const appId = useAtomValue(selectedAppIdAtom);
-  const { streamMessage } = useStreamChat();
-  const navigate = useNavigate();
-  const onClick = async () => {
-    if (!appId) {
-      console.error("No app id found");
-      return;
-    }
-    try {
-      const newChatId = await IpcClient.getInstance().createChat(appId);
-      // navigate to new chat
-      await navigate({ to: "/chat", search: { id: newChatId } });
-      await streamMessage({
-        prompt: "Summarize from chat-id=" + chatId,
-        chatId: newChatId,
-      });
-    } catch (err) {
-      showError(err);
-    }
-  };
+  const { t } = useTranslation("chat");
+  const { handleSummarize } = useSummarizeInNewChat();
   return (
     <SuggestionButton
-      onClick={onClick}
-      tooltipText="Creating a new chat makes the AI more focused and efficient"
+      onClick={handleSummarize}
+      tooltipText={t("summarizeNewChatTip")}
     >
-      Summarize to new chat
+      {t("summarizeToNewChat")}
     </SuggestionButton>
   );
 }
 
 function RefactorFileButton({ path }: { path: string }) {
+  const { t } = useTranslation("chat");
   const chatId = useAtomValue(selectedChatIdAtom);
   const { streamMessage } = useStreamChat();
   const onClick = () => {
@@ -445,7 +1372,7 @@ function RefactorFileButton({ path }: { path: string }) {
       return;
     }
     streamMessage({
-      prompt: `Refactor ${path} and make it more modular`,
+      prompt: t("refactorFile", { path }),
       chatId,
       redo: false,
     });
@@ -453,16 +1380,17 @@ function RefactorFileButton({ path }: { path: string }) {
   return (
     <SuggestionButton
       onClick={onClick}
-      tooltipText="Refactor the file to improve maintainability"
+      tooltipText={[t("refactorDescription"), path]}
     >
       <span className="max-w-[180px] overflow-hidden whitespace-nowrap text-ellipsis">
-        Refactor {path.split("/").slice(-2).join("/")}
+        {t("refactorFile", { path: path.split("/").slice(-2).join("/") })}
       </span>
     </SuggestionButton>
   );
 }
 
 function WriteCodeProperlyButton() {
+  const { t } = useTranslation("chat");
   const chatId = useAtomValue(selectedChatIdAtom);
   const { streamMessage } = useStreamChat();
   const onClick = () => {
@@ -479,14 +1407,15 @@ function WriteCodeProperlyButton() {
   return (
     <SuggestionButton
       onClick={onClick}
-      tooltipText="Write code properly (useful when AI generates the code in the wrong format)"
+      tooltipText={t("writeCodeProperlyDescription")}
     >
-      Write code properly
+      {t("writeCodeProperly")}
     </SuggestionButton>
   );
 }
 
 function RebuildButton() {
+  const { t } = useTranslation("chat");
   const { restartApp } = useRunApp();
   const posthog = usePostHog();
   const selectedAppId = useAtomValue(selectedAppIdAtom);
@@ -499,13 +1428,17 @@ function RebuildButton() {
   }, [selectedAppId, posthog, restartApp]);
 
   return (
-    <SuggestionButton onClick={onClick} tooltipText="Rebuild the application">
-      Rebuild app
+    <SuggestionButton
+      onClick={onClick}
+      tooltipText={t("rebuildAppDescription")}
+    >
+      {t("rebuildApp")}
     </SuggestionButton>
   );
 }
 
 function RestartButton() {
+  const { t } = useTranslation("chat");
   const { restartApp } = useRunApp();
   const posthog = usePostHog();
   const selectedAppId = useAtomValue(selectedAppIdAtom);
@@ -520,14 +1453,15 @@ function RestartButton() {
   return (
     <SuggestionButton
       onClick={onClick}
-      tooltipText="Restart the development server"
+      tooltipText={t("restartAppDescription")}
     >
-      Restart app
+      {t("restartApp")}
     </SuggestionButton>
   );
 }
 
 function RefreshButton() {
+  const { t } = useTranslation("chat");
   const { refreshAppIframe } = useRunApp();
   const posthog = usePostHog();
 
@@ -539,14 +1473,15 @@ function RefreshButton() {
   return (
     <SuggestionButton
       onClick={onClick}
-      tooltipText="Refresh the application preview"
+      tooltipText={t("refreshAppDescription")}
     >
-      Refresh app
+      {t("refreshApp")}
     </SuggestionButton>
   );
 }
 
 function KeepGoingButton() {
+  const { t } = useTranslation("chat");
   const { streamMessage } = useStreamChat();
   const chatId = useAtomValue(selectedChatIdAtom);
   const onClick = () => {
@@ -560,13 +1495,35 @@ function KeepGoingButton() {
     });
   };
   return (
-    <SuggestionButton onClick={onClick} tooltipText="Keep going">
-      Keep going
+    <SuggestionButton onClick={onClick} tooltipText={t("keepGoing")}>
+      {t("keepGoing")}
     </SuggestionButton>
   );
 }
 
-function mapActionToButton(action: SuggestedAction) {
+function AddTypeScriptButton() {
+  const { t } = useTranslation("chat");
+  const { streamMessage } = useStreamChat();
+  const chatId = useAtomValue(selectedChatIdAtom);
+  const onClick = () => {
+    if (!chatId) {
+      console.error("No chat id found");
+      return;
+    }
+    streamMessage({
+      prompt:
+        "Add TypeScript to this project: install `typescript` as a dev dependency and create a lenient tsconfig (`allowJs: true`, `strict: false`) so existing JavaScript keeps working.",
+      chatId,
+    });
+  };
+  return (
+    <SuggestionButton onClick={onClick} tooltipText={t("addTypeScript")}>
+      {t("addTypeScript")}
+    </SuggestionButton>
+  );
+}
+
+export function mapActionToButton(action: SuggestedAction) {
   switch (action.id) {
     case "summarize-in-new-chat":
       return <SummarizeInNewChatButton />;
@@ -582,6 +1539,8 @@ function mapActionToButton(action: SuggestedAction) {
       return <RefreshButton />;
     case "keep-going":
       return <KeepGoingButton />;
+    case "add-typescript":
+      return <AddTypeScriptButton />;
     default:
       console.error(`Unsupported action: ${action.id}`);
       return (
@@ -620,10 +1579,11 @@ function ChatInputActions({
   isApproving,
   isRejecting,
 }: ChatInputActionsProps) {
+  const { t } = useTranslation("chat");
   const [isDetailsVisible, setIsDetailsVisible] = useState(false);
 
   if (proposal.type === "tip-proposal") {
-    return <div>Tip proposal</div>;
+    return <div>{t("tipProposal")}</div>;
   }
   if (proposal.type === "action-proposal") {
     return <ActionProposalActions proposal={proposal}></ActionProposalActions>;
@@ -678,7 +1638,7 @@ function ChatInputActions({
           </button>
           {proposal.securityRisks.length > 0 && (
             <span className="bg-red-100 text-red-700 text-xs font-medium px-2 py-0.5 rounded-full flex-shrink-0">
-              Security risks found
+              {t("securityRisksFound")}
             </span>
           )}
         </div>
@@ -698,7 +1658,7 @@ function ChatInputActions({
             ) : (
               <Check size={16} className="mr-1" />
             )}
-            Approve
+            {t("approve")}
           </Button>
           <Button
             className="px-8"
@@ -713,11 +1673,8 @@ function ChatInputActions({
             ) : (
               <X size={16} className="mr-1" />
             )}
-            Reject
+            {t("reject")}
           </Button>
-          <div className="flex items-center space-x-1 ml-auto">
-            <AutoApproveSwitch />
-          </div>
         </div>
       </div>
 
@@ -726,7 +1683,7 @@ function ChatInputActions({
           <div className="p-3 border-t border-border bg-muted/50 text-sm">
             {!!proposal.securityRisks.length && (
               <div className="mb-3">
-                <h4 className="font-semibold mb-1">Security Risks</h4>
+                <h4 className="font-semibold mb-1">{t("securityRisks")}</h4>
                 <ul className="space-y-1">
                   {proposal.securityRisks.map((risk, index) => (
                     <li key={index} className="flex items-start space-x-2">
@@ -753,7 +1710,7 @@ function ChatInputActions({
 
             {proposal.sqlQueries?.length > 0 && (
               <div className="mb-3">
-                <h4 className="font-semibold mb-1">SQL Queries</h4>
+                <h4 className="font-semibold mb-1">{t("sqlQueries")}</h4>
                 <ul className="space-y-2">
                   {proposal.sqlQueries.map((query, index) => (
                     <SqlQueryItem key={index} query={query} />
@@ -764,16 +1721,14 @@ function ChatInputActions({
 
             {proposal.packagesAdded?.length > 0 && (
               <div className="mb-3">
-                <h4 className="font-semibold mb-1">Packages Added</h4>
+                <h4 className="font-semibold mb-1">{t("packagesAdded")}</h4>
                 <ul className="space-y-1">
                   {proposal.packagesAdded.map((pkg, index) => (
                     <li
                       key={index}
                       className="flex items-center space-x-2"
                       onClick={() => {
-                        IpcClient.getInstance().openExternalUrl(
-                          `https://www.npmjs.com/package/${pkg}`,
-                        );
+                        ipc.system.openExternalUrl(getNpmPackagePageUrl(pkg));
                       }}
                     >
                       <Package
@@ -791,7 +1746,9 @@ function ChatInputActions({
 
             {serverFunctions.length > 0 && (
               <div className="mb-3">
-                <h4 className="font-semibold mb-1">Server Functions Changed</h4>
+                <h4 className="font-semibold mb-1">
+                  {t("serverFunctionsChanged")}
+                </h4>
                 <ul className="space-y-1">
                   {serverFunctions.map((file: FileChange, index: number) => (
                     <li key={index} className="flex items-center space-x-2">
@@ -813,7 +1770,7 @@ function ChatInputActions({
 
             {otherFilesChanged.length > 0 && (
               <div>
-                <h4 className="font-semibold mb-1">Files Changed</h4>
+                <h4 className="font-semibold mb-1">{t("filesChanged")}</h4>
                 <ul className="space-y-1">
                   {otherFilesChanged.map((file: FileChange, index: number) => (
                     <li key={index} className="flex items-center space-x-2">
@@ -868,6 +1825,8 @@ function ProposalSummary({
   packagesAdded?: string[];
   filesChanged?: FileChange[];
 }) {
+  const { t } = useTranslation("chat");
+
   // If no changes, show a simple message
   if (
     !sqlQueries.length &&
@@ -875,7 +1834,7 @@ function ProposalSummary({
     !packagesAdded.length &&
     !filesChanged.length
   ) {
-    return <span>No changes</span>;
+    return <span>{t("noChanges")}</span>;
   }
 
   // Build parts array with only the segments that have content
@@ -883,25 +1842,19 @@ function ProposalSummary({
 
   if (sqlQueries.length) {
     parts.push(
-      `${sqlQueries.length} SQL ${
-        sqlQueries.length === 1 ? "query" : "queries"
-      }`,
+      `${sqlQueries.length} SQL ${sqlQueries.length === 1 ? "query" : "queries"}`,
     );
   }
 
   if (serverFunctions.length) {
     parts.push(
-      `${serverFunctions.length} Server ${
-        serverFunctions.length === 1 ? "Function" : "Functions"
-      }`,
+      `${serverFunctions.length} Server ${serverFunctions.length === 1 ? "Function" : "Functions"}`,
     );
   }
 
   if (packagesAdded.length) {
     parts.push(
-      `${packagesAdded.length} ${
-        packagesAdded.length === 1 ? "package" : "packages"
-      }`,
+      `${packagesAdded.length} ${packagesAdded.length === 1 ? "package" : "packages"}`,
     );
   }
 
@@ -917,10 +1870,19 @@ function ProposalSummary({
 
 // SQL Query item with expandable functionality
 function SqlQueryItem({ query }: { query: SqlQuery }) {
+  const { t } = useTranslation("chat");
   const [isExpanded, setIsExpanded] = useState(false);
 
   const queryContent = query.content;
   const queryDescription = query.description;
+  const sqlMutatesSchema = useMemo(
+    () => doesSqlMutateSchema(queryContent),
+    [queryContent],
+  );
+  const sqlDeletesData = useMemo(
+    () => doesSqlDeleteData(queryContent),
+    [queryContent],
+  );
 
   return (
     <li
@@ -931,8 +1893,20 @@ function SqlQueryItem({ query }: { query: SqlQuery }) {
         <div className="flex items-center gap-2">
           <Database size={16} className="text-muted-foreground flex-shrink-0" />
           <span className="text-sm font-medium">
-            {queryDescription || "SQL Query"}
+            {queryDescription || t("sqlQuery")}
           </span>
+          {sqlMutatesSchema && (
+            <span className="inline-flex items-center gap-1 text-xs font-medium text-amber-700 dark:text-amber-400">
+              <AlertTriangle className="h-3.5 w-3.5 flex-shrink-0" />
+              {t("changesDatabaseSchema")}
+            </span>
+          )}
+          {sqlDeletesData && (
+            <span className="inline-flex items-center gap-1 text-xs font-medium text-red-700 dark:text-red-400">
+              <AlertTriangle className="h-3.5 w-3.5 flex-shrink-0" />
+              {t("destructiveDataChange")}
+            </span>
+          )}
         </div>
         <div>
           {isExpanded ? (

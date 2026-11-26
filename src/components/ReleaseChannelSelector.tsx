@@ -1,5 +1,6 @@
 import { useSettings } from "@/hooks/useSettings";
 
+import { SettingField } from "@/components/settings/SettingField";
 import {
   Select,
   SelectContent,
@@ -8,11 +9,13 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { toast } from "sonner";
-import { IpcClient } from "@/ipc/ipc_client";
+import { ipc } from "@/ipc/types";
 import type { ReleaseChannel } from "@/lib/schemas";
+import { useTranslation } from "react-i18next";
 
 export function ReleaseChannelSelector() {
   const { settings, updateSettings } = useSettings();
+  const { t } = useTranslation("settings");
 
   if (!settings) {
     return null;
@@ -27,7 +30,7 @@ export function ReleaseChannelSelector() {
         action: {
           label: "Download Stable",
           onClick: () => {
-            IpcClient.getInstance().openExternalUrl("https://dyad.sh/download");
+            ipc.system.openExternalUrl("https://dyad.sh/download");
           },
         },
       });
@@ -38,7 +41,7 @@ export function ReleaseChannelSelector() {
         action: {
           label: "Restart Dyad",
           onClick: () => {
-            IpcClient.getInstance().restartDyad();
+            ipc.system.restartDyad();
           },
         },
       });
@@ -46,31 +49,27 @@ export function ReleaseChannelSelector() {
   };
 
   return (
-    <div className="space-y-1">
-      <div className="flex items-center space-x-2">
-        <label
-          htmlFor="release-channel"
-          className="text-sm font-medium text-gray-700 dark:text-gray-300"
+    <SettingField
+      htmlFor="release-channel"
+      label={t("general.releaseChannel")}
+      description={t("general.releaseChannelDescription")}
+    >
+      <Select
+        value={settings.releaseChannel}
+        onValueChange={(v) => v && handleReleaseChannelChange(v)}
+      >
+        <SelectTrigger
+          className="w-full sm:w-[240px]"
+          id="release-channel"
+          aria-describedby="release-channel-description"
         >
-          Release Channel
-        </label>
-        <Select
-          value={settings.releaseChannel}
-          onValueChange={handleReleaseChannelChange}
-        >
-          <SelectTrigger className="w-32" id="release-channel">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="stable">Stable</SelectItem>
-            <SelectItem value="beta">Beta</SelectItem>
-          </SelectContent>
-        </Select>
-      </div>
-      <div className="text-sm text-gray-500 dark:text-gray-400">
-        <p>Stable is recommended for most users. </p>
-        <p>Beta receives more frequent updates but may have more bugs.</p>
-      </div>
-    </div>
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="stable">{t("general.stable")}</SelectItem>
+          <SelectItem value="beta">{t("general.beta")}</SelectItem>
+        </SelectContent>
+      </Select>
+    </SettingField>
   );
 }

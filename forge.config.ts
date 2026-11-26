@@ -1,12 +1,75 @@
+import { windowsSign } from "./windowsSign";
+import {
+  removeUnusedAppPackageFiles,
+  removeUnusedCopiedResources,
+} from "./src/lib/packaging_cleanup";
+import { stagePostHogSourcemaps } from "./src/lib/posthog_sourcemaps";
 import type { ForgeConfig } from "@electron-forge/shared-types";
 import { MakerSquirrel } from "@electron-forge/maker-squirrel";
 import { MakerZIP } from "@electron-forge/maker-zip";
 import { MakerDeb } from "@electron-forge/maker-deb";
 import { MakerRpm } from "@electron-forge/maker-rpm";
+import { MakerAppImage } from "./makers/MakerAppImage";
 import { VitePlugin } from "@electron-forge/plugin-vite";
 import { FusesPlugin } from "@electron-forge/plugin-fuses";
 import { FuseV1Options, FuseVersion } from "@electron/fuses";
 import { AutoUnpackNativesPlugin } from "@electron-forge/plugin-auto-unpack-natives";
+import { readFileSync } from "fs";
+import { createRequire } from "module";
+
+console.log("AZURE_CODE_SIGNING_DLIB", process.env.AZURE_CODE_SIGNING_DLIB);
+
+const require = createRequire(import.meta.url);
+const { isPrereleaseVersion } =
+  require("./scripts/release-version-utils.js") as {
+    isPrereleaseVersion: (version: string) => boolean;
+  };
+const packageJson = JSON.parse(
+  readFileSync(new URL("./package.json", import.meta.url), "utf8"),
+) as { version: string };
+
+const pgRuntimeDependencies = [
+  "pg",
+  "pg-cloudflare",
+  "pg-connection-string",
+  "pg-int8",
+  "pg-pool",
+  "pg-protocol",
+  "pg-types",
+  "pgpass",
+  "postgres-array",
+  "postgres-bytea",
+  "postgres-date",
+  "postgres-interval",
+  "split2",
+  "xtend",
+] as const;
+
+/**
+ * What ssh2 needs at runtime, and only that.
+ *
+ * Its optional native helpers — cpu-features, nan, buildcheck — are left out
+ * on purpose. ssh2 guards those requires and falls back to pure JavaScript,
+ * so leaving them behind costs some speed and avoids shipping a binding
+ * compiled against whatever Node the build machine happened to have.
+ */
+const ssh2RuntimeDependencies = [
+  "ssh2",
+  "asn1",
+  "safer-buffer",
+  "bcrypt-pbkdf",
+  "tweetnacl",
+] as const;
+
+function isRuntimeDependency(
+  file: string,
+  packages: readonly string[],
+): boolean {
+  return packages.some((dependency) => {
+    const modulePath = `/node_modules/${dependency}`;
+    return file === modulePath || file.startsWith(`${modulePath}/`);
+  });
+}
 
 // Based on https://github.com/electron/forge/blob/6b2d547a7216c30fde1e1fddd1118eee5d872945/packages/plugin/vite/src/VitePlugin.ts#L124
 const ignore = (file: string) => {
@@ -32,13 +95,49 @@ const ignore = (file: string) => {
   if (file.startsWith("/node_modules/stacktrace-js/dist")) {
     return false;
   }
+  if (file.startsWith("/node_modules/html-to-image")) {
+    return false;
+  }
   if (file.startsWith("/node_modules/better-sqlite3")) {
+    return false;
+  }
+  if (file.startsWith("/node_modules/dyad-keychain-reader")) {
+    return false;
+  }
+  if (file.startsWith("/node_modules/node-pty")) {
+    return false;
+  }
+  if (isRuntimeDependency(file, ssh2RuntimeDependencies)) {
+    return false;
+  }
+  if (file.startsWith("/node_modules/mustardscript")) {
+    return false;
+  }
+  if (file.startsWith("/node_modules/@mustardscript")) {
+    return false;
+  }
+  if (file.startsWith("/node_modules/node-addon-api")) {
     return false;
   }
   if (file.startsWith("/node_modules/bindings")) {
     return false;
   }
   if (file.startsWith("/node_modules/file-uri-to-path")) {
+    return false;
+  }
+  if (file === "/node_modules/@typescript") {
+    return false;
+  }
+  if (file.startsWith("/node_modules/@typescript/typescript6")) {
+    return false;
+  }
+  if (file.startsWith("/node_modules/@typescript/old")) {
+    return false;
+  }
+  if (isRuntimeDependency(file, pgRuntimeDependencies)) {
+    return false;
+  }
+  if (file === "/node_modules/ws" || file.startsWith("/node_modules/ws/")) {
     return false;
   }
   if (file.startsWith("/.vite")) {
@@ -49,9 +148,57 @@ const ignore = (file: string) => {
 };
 
 const isEndToEndTestBuild = process.env.E2E_TEST_BUILD === "true";
+const isWindowsSigningEnabled = process.env.WINDOWS_SIGN === "true";
+const shouldSkipNativeRebuild = process.env.DYAD_SKIP_NATIVE_REBUILD === "true";
+const nativeRebuildModules = [
+  "better-sqlite3",
+  "node-pty",
+  "mustardscript",
+  ...(process.platform === "darwin" ? ["dyad-keychain-reader"] : []),
+];
+
+if (isWindowsSigningEnabled && !process.env.AZURE_CODE_SIGNING_DLIB) {
+  throw new Error(
+    "WINDOWS_SIGN is enabled but AZURE_CODE_SIGNING_DLIB is not set. " +
+      "Ensure Azure Trusted Signing tools are installed.",
+  );
+}
 
 const config: ForgeConfig = {
   packagerConfig: {
+    // E2E test builds install local file: dependencies as links on Windows.
+    // Dereference them so packaging does not require symlink privileges in the temp app.
+    // Local file: native packages install as symlinks; dereference them so the
+    // packaged app contains loadable runtime files.
+    derefSymlinks: true,
+    windowsSign: isWindowsSigningEnabled ? windowsSign : undefined,
+    afterCopy: [
+      (buildPath, _electronVersion, platform, arch, callback) => {
+        removeUnusedAppPackageFiles(buildPath, platform, arch).then(
+          () => callback(),
+          (error) => callback(error as Error),
+        );
+      },
+      // Must run after the cleanup above and before the asar is created, so
+      // the shipped bundles are the ones carrying the chunk IDs.
+      (buildPath, _electronVersion, platform, arch, callback) => {
+        stagePostHogSourcemaps({
+          buildPath,
+          target: `${platform}-${arch}`,
+        }).then(
+          () => callback(),
+          (error) => callback(error as Error),
+        );
+      },
+    ],
+    afterCopyExtraResources: [
+      (buildPath, _electronVersion, platform, _arch, callback) => {
+        removeUnusedCopiedResources(buildPath, platform).then(
+          () => callback(),
+          (error) => callback(error as Error),
+        );
+      },
+    ],
     protocols: [
       {
         name: "Dyad",
@@ -62,9 +209,15 @@ const config: ForgeConfig = {
 
     osxSign: isEndToEndTestBuild
       ? undefined
-      : {
+      : ({
           identity: process.env.APPLE_TEAM_ID,
-        },
+          // Surface the actual signing error instead of silently continuing
+          // (@electron/packager defaults continueOnError to true, which masks failures)
+          continueOnError: false,
+          // Skip provisioning profile search (not needed for Developer ID distribution,
+          // and the cwd scan crashes on broken symlinks like CLAUDE.md)
+          preEmbedProvisioningProfile: false,
+        } as Record<string, unknown>),
     osxNotarize: isEndToEndTestBuild
       ? undefined
       : {
@@ -72,24 +225,52 @@ const config: ForgeConfig = {
           appleIdPassword: process.env.APPLE_PASSWORD!,
           teamId: process.env.APPLE_TEAM_ID!,
         },
-    asar: true,
+    asar: {
+      // Native modules and node-pty helper binaries must be loadable from disk.
+      unpackDir:
+        "{node_modules/dyad-keychain-reader,node_modules/node-pty,node_modules/mustardscript,node_modules/@mustardscript}",
+    },
     ignore,
+    extraResource: ["node_modules/dugite/git", "node_modules/@vscode"],
     // ignore: [/node_modules\/(?!(better-sqlite3|bindings|file-uri-to-path)\/)/],
   },
-  rebuildConfig: {
-    extraModules: ["better-sqlite3"],
-    force: true,
-  },
+  rebuildConfig: shouldSkipNativeRebuild
+    ? { onlyModules: [] }
+    : {
+        extraModules: nativeRebuildModules,
+        force: true,
+      },
   makers: [
-    new MakerSquirrel({
-      signWithParams: `/sha1 ${process.env.SM_CODE_SIGNING_CERT_SHA1_HASH} /tr http://timestamp.digicert.com /td SHA256 /fd SHA256`,
-    }),
+    new MakerSquirrel(
+      // @ts-expect-error - incorrect types exported by MakerSquirrel
+      isWindowsSigningEnabled
+        ? {
+            windowsSign,
+            iconUrl:
+              "https://raw.githubusercontent.com/dyad-sh/dyad/main/assets/icon/logo.ico",
+            setupIcon: "./assets/icon/logo.ico",
+          }
+        : {
+            iconUrl:
+              "https://raw.githubusercontent.com/dyad-sh/dyad/main/assets/icon/logo.ico",
+            setupIcon: "./assets/icon/logo.ico",
+          },
+    ),
     new MakerZIP({}, ["darwin"]),
-    new MakerRpm({}),
+    new MakerRpm({
+      options: {
+        mimeType: ["x-scheme-handler/dyad"],
+        icon: "./assets/icon/logo.png",
+      },
+    }),
     new MakerDeb({
       options: {
         mimeType: ["x-scheme-handler/dyad"],
+        icon: "./assets/icon/logo.png",
       },
+    }),
+    new MakerAppImage({
+      icon: "./assets/icon/logo.png",
     }),
   ],
   publishers: [
@@ -102,7 +283,7 @@ const config: ForgeConfig = {
         },
         draft: true,
         force: true,
-        prerelease: true,
+        prerelease: isPrereleaseVersion(packageJson.version),
       },
     },
   ],
@@ -114,7 +295,7 @@ const config: ForgeConfig = {
       build: [
         {
           // `entry` is just an alias for `build.lib.entry` in the corresponding file of `config`.
-          entry: "src/main.ts",
+          entry: "src/main_bootstrap.ts",
           config: "vite.main.config.mts",
           target: "main",
         },
@@ -124,8 +305,19 @@ const config: ForgeConfig = {
           target: "preload",
         },
         {
-          entry: "workers/tsc/tsc_worker.ts",
-          config: "vite.worker.config.mts",
+          entry: "workers/code_explorer/code_explorer_worker.ts",
+          config: "vite.code-explorer-worker.config.mts",
+          target: "main",
+        },
+        {
+          entry:
+            "workers/supabase_dependency_analysis/supabase_dependency_analysis_worker.ts",
+          config: "vite.supabase-dependency-analysis-worker.config.mts",
+          target: "main",
+        },
+        {
+          entry: "src/ipc/utils/sandbox/sandbox_worker.ts",
+          config: "vite.sandbox-worker.config.mts",
           target: "main",
         },
       ],

@@ -1,4 +1,13 @@
-import { Info, KeyRound, Trash2 } from "lucide-react";
+import { useState } from "react";
+import {
+  ArrowUp,
+  Info,
+  KeyRound,
+  Trash2,
+  Clipboard,
+  Eye,
+  EyeOff,
+} from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
   Accordion,
@@ -6,15 +15,29 @@ import {
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import { AzureConfiguration } from "./AzureConfiguration";
+import { VertexConfiguration } from "./VertexConfiguration";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { UserSettings } from "@/lib/schemas";
+import { showError } from "@/lib/toast";
 
 // Helper function to mask ENV API keys (move or duplicate if needed elsewhere)
 const maskEnvApiKey = (key: string | undefined): string => {
   if (!key) return "Not Set";
   if (key.length < 8) return "****";
   return `${key.substring(0, 4)}...${key.substring(key.length - 4)}`;
+};
+
+const maskUserApiKey = (key: string | undefined): string => {
+  if (!key) return "Not Set";
+  if (key.length < 12) return "••••••••";
+  return key.slice(0, 4) + "••••••••" + key.slice(-4);
 };
 
 interface ApiKeyConfigurationProps {
@@ -24,12 +47,18 @@ interface ApiKeyConfigurationProps {
   envVars: Record<string, string | undefined>;
   envVarName?: string;
   isSaving: boolean;
+  isTesting: boolean;
   saveError: string | null;
+  testSuccessMessage: string | null;
   apiKeyInput: string;
   onApiKeyInputChange: (value: string) => void;
-  onSaveKey: () => Promise<void>;
+  onSaveKey: (value: string) => Promise<void>;
+  onTestKey?: (value: string) => Promise<void>;
   onDeleteKey: () => Promise<void>;
   isDyad: boolean;
+  updateSettings: (settings: Partial<UserSettings>) => Promise<UserSettings>;
+  highlightPasteButton?: boolean;
+  onDismissPasteHighlight?: () => void;
 }
 
 export function ApiKeyConfiguration({
@@ -39,13 +68,48 @@ export function ApiKeyConfiguration({
   envVars,
   envVarName,
   isSaving,
+  isTesting,
   saveError,
+  testSuccessMessage,
   apiKeyInput,
   onApiKeyInputChange,
   onSaveKey,
+  onTestKey,
   onDeleteKey,
   isDyad,
+  updateSettings,
+  highlightPasteButton = false,
+  onDismissPasteHighlight,
 }: ApiKeyConfigurationProps) {
+  const [showUserApiKey, setShowUserApiKey] = useState(false);
+  const [prevProvider, setPrevProvider] = useState(provider);
+
+  // Render-phase state update: synchronously reset key visibility when switching providers.
+  if (provider !== prevProvider) {
+    setPrevProvider(provider);
+    setShowUserApiKey(false);
+  }
+
+  const handleSave = async (value: string) => {
+    await onSaveKey(value);
+    setShowUserApiKey(false);
+  };
+
+  // Special handling for Azure OpenAI which requires environment variables
+  if (provider === "azure") {
+    return (
+      <AzureConfiguration
+        settings={settings}
+        envVars={envVars}
+        updateSettings={updateSettings}
+      />
+    );
+  }
+  // Special handling for Google Vertex AI which uses service account credentials
+  if (provider === "vertex") {
+    return <VertexConfiguration />;
+  }
+
   const envApiKey = envVarName ? envVars[envVarName] : undefined;
   const userApiKey = settings?.providerSettings?.[provider]?.apiKey?.value;
 
@@ -54,6 +118,7 @@ export function ApiKeyConfiguration({
     !userApiKey.startsWith("Invalid Key") &&
     userApiKey !== "Not Set";
   const hasEnvKey = !!envApiKey;
+  const isMutatingKey = isSaving || isTesting;
 
   const activeKeySource = isValidUserKey
     ? "settings"
@@ -71,7 +136,7 @@ export function ApiKeyConfiguration({
 
   return (
     <Accordion
-      type="multiple"
+      multiple
       className="w-full space-y-4"
       defaultValue={defaultAccordionValue}
     >
@@ -92,7 +157,7 @@ export function ApiKeyConfiguration({
                   variant="destructive"
                   size="sm"
                   onClick={onDeleteKey}
-                  disabled={isSaving}
+                  disabled={isMutatingKey}
                   className="flex items-center gap-1 h-7 px-2"
                 >
                   <Trash2 className="h-4 w-4" />
@@ -100,7 +165,27 @@ export function ApiKeyConfiguration({
                 </Button>
               </AlertTitle>
               <AlertDescription>
-                <p className="font-mono text-sm">{userApiKey}</p>
+                <div className="flex items-center justify-between gap-2 w-full">
+                  <p className="font-mono text-sm break-all mr-2">
+                    {showUserApiKey ? userApiKey : maskUserApiKey(userApiKey)}
+                  </p>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    aria-label={
+                      showUserApiKey ? "Hide API key" : "Show API key"
+                    }
+                    onClick={() => setShowUserApiKey((prev) => !prev)}
+                    className="text-muted-foreground hover:text-foreground shrink-0"
+                  >
+                    {showUserApiKey ? (
+                      <EyeOff className="h-4 w-4" />
+                    ) : (
+                      <Eye className="h-4 w-4" />
+                    )}
+                  </Button>
+                </div>
                 {activeKeySource === "settings" && (
                   <p className="text-xs text-green-600 dark:text-green-400 mt-1">
                     This key is currently active.
@@ -125,11 +210,83 @@ export function ApiKeyConfiguration({
                 placeholder={`Enter new ${providerDisplayName} API Key here`}
                 className={`flex-grow ${saveError ? "border-red-500" : ""}`}
               />
-              <Button onClick={onSaveKey} disabled={isSaving || !apiKeyInput}>
+              <Popover
+                open={highlightPasteButton}
+                onOpenChange={(open) => {
+                  if (!open) {
+                    onDismissPasteHighlight?.();
+                  }
+                }}
+              >
+                <PopoverTrigger
+                  render={
+                    <Button
+                      onClick={async () => {
+                        let text = "";
+                        try {
+                          text = await navigator.clipboard.readText();
+                        } catch (error) {
+                          showError("Failed to paste from clipboard");
+                          console.error(
+                            "Failed to paste from clipboard",
+                            error,
+                          );
+                          return;
+                        }
+
+                        if (text) {
+                          await handleSave(text);
+                        }
+                      }}
+                      disabled={isMutatingKey}
+                      variant={apiKeyInput ? "outline" : "default"}
+                      className={
+                        highlightPasteButton
+                          ? "ring-4 ring-primary/60 shadow-lg shadow-primary/30"
+                          : undefined
+                      }
+                      title="Paste from clipboard and save"
+                    >
+                      <Clipboard className="h-4 w-4" />
+                      Paste & Save
+                    </Button>
+                  }
+                />
+                <PopoverContent
+                  side="bottom"
+                  align="center"
+                  className="w-fit py-2 px-3 bg-background text-primary shadow-lg ring-1 ring-primary/40"
+                >
+                  <div className="text-sm font-semibold flex items-center gap-1">
+                    <ArrowUp /> Copied your API key? Click to paste & save it
+                  </div>
+                </PopoverContent>
+              </Popover>
+
+              <Button
+                onClick={() => handleSave(apiKeyInput)}
+                disabled={isMutatingKey || !apiKeyInput}
+                variant={apiKeyInput ? "default" : "outline"}
+              >
                 {isSaving ? "Saving..." : "Save Key"}
               </Button>
+              {onTestKey && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => onTestKey(apiKeyInput || userApiKey || "")}
+                  disabled={isMutatingKey || (!apiKeyInput && !userApiKey)}
+                >
+                  {isTesting ? "Testing..." : "Test Key"}
+                </Button>
+              )}
             </div>
             {saveError && <p className="text-xs text-red-600">{saveError}</p>}
+            {testSuccessMessage && (
+              <p className="text-xs text-green-600 dark:text-green-400">
+                {testSuccessMessage}
+              </p>
+            )}
             <p className="text-xs text-gray-500 dark:text-gray-400">
               Setting a key here will override the environment variable (if
               set).

@@ -1,12 +1,13 @@
 import path from "path";
-import { test } from "./helpers/test_helper";
+import { test, Timeout } from "./helpers/test_helper";
 import { expect } from "@playwright/test";
 import * as fs from "fs";
 
-// It's hard to read the snapshots, but they should be identical across
-// all test cases in this file, so we use the same snapshot name to ensure
-// the outputs are identical.
-const SNAPSHOT_NAME = "attach-image";
+// The in-chat picker and drag-and-drop requests should stay identical. The
+// home request has no prior assistant turn, so it does not include Git
+// provenance and uses a separate baseline.
+const CHAT_SNAPSHOT_NAME = "attach-image";
+const HOME_SNAPSHOT_NAME = "attach-image-home";
 
 // attach image is implemented in two separate components
 // - HomeChatInput
@@ -15,12 +16,31 @@ const SNAPSHOT_NAME = "attach-image";
 test("attach image - home chat", async ({ po }) => {
   await po.setUp();
 
-  await po
+  // Open auxiliary actions menu
+  await po.chatActions
     .getHomeChatInputContainer()
-    .getByTestId("chat-context-file-input")
-    .setInputFiles("e2e-tests/fixtures/images/logo.png");
+    .getByTestId("auxiliary-actions-menu")
+    .click();
+
+  // Click "Attach files" to open submenu
+  await po.page.getByRole("menuitem", { name: "Attach files" }).click();
+
+  // Wait for submenu content to be visible
+  const chatContextItem = po.page.getByText("Attach file as chat context");
+  await expect(chatContextItem).toBeVisible();
+
+  // Set up file chooser listener BEFORE clicking the menu item
+  const fileChooserPromise = po.page.waitForEvent("filechooser");
+
+  // Click the menu item to trigger the file picker
+  await chatContextItem.click();
+
+  // Handle the file chooser dialog
+  const fileChooser = await fileChooserPromise;
+  await fileChooser.setFiles("e2e-tests/fixtures/images/logo.png");
+
   await po.sendPrompt("[dump]");
-  await po.snapshotServerDump("last-message", { name: SNAPSHOT_NAME });
+  await po.snapshotServerDump("last-message", { name: HOME_SNAPSHOT_NAME });
   await po.snapshotMessages({ replaceDumpPath: true });
 });
 
@@ -28,13 +48,31 @@ test("attach image - chat", async ({ po }) => {
   await po.setUp({ autoApprove: true });
   await po.sendPrompt("basic");
 
-  // attach via file input (click-to-upload)
-  await po
+  // Open auxiliary actions menu
+  await po.chatActions
     .getChatInputContainer()
-    .getByTestId("chat-context-file-input")
-    .setInputFiles("e2e-tests/fixtures/images/logo.png");
+    .getByTestId("auxiliary-actions-menu")
+    .click();
+
+  // Click "Attach files" to open submenu
+  await po.page.getByRole("menuitem", { name: "Attach files" }).click();
+
+  // Wait for submenu content to be visible
+  const chatContextItem = po.page.getByText("Attach file as chat context");
+  await expect(chatContextItem).toBeVisible();
+
+  // Set up file chooser listener BEFORE clicking the menu item
+  const fileChooserPromise = po.page.waitForEvent("filechooser");
+
+  // Click the menu item to trigger the file picker
+  await chatContextItem.click();
+
+  // Handle the file chooser dialog
+  const fileChooser = await fileChooserPromise;
+  await fileChooser.setFiles("e2e-tests/fixtures/images/logo.png");
+
   await po.sendPrompt("[dump]");
-  await po.snapshotServerDump("last-message", { name: SNAPSHOT_NAME });
+  await po.snapshotServerDump("last-message", { name: CHAT_SNAPSHOT_NAME });
   await po.snapshotMessages({ replaceDumpPath: true });
 });
 
@@ -42,18 +80,47 @@ test("attach image - chat - upload to codebase", async ({ po }) => {
   await po.setUp({ autoApprove: true });
   await po.sendPrompt("basic");
 
-  // attach via file input (click-to-upload)
-  await po
+  // Open auxiliary actions menu
+  await po.chatActions
     .getChatInputContainer()
-    .getByTestId("upload-to-codebase-file-input")
-    .setInputFiles("e2e-tests/fixtures/images/logo.png");
-  await po.sendPrompt("[[UPLOAD_IMAGE_TO_CODEBASE]]");
+    .getByTestId("auxiliary-actions-menu")
+    .click();
 
-  await po.snapshotServerDump("last-message", { name: "upload-to-codebase" });
+  // Click "Attach files" to open submenu
+  await po.page.getByRole("menuitem", { name: "Attach files" }).click();
+
+  // Wait for submenu content to be visible
+  const uploadItem = po.page.getByText("Upload file to codebase");
+  await expect(uploadItem).toBeVisible();
+
+  // Set up file chooser listener BEFORE clicking the menu item
+  const fileChooserPromise = po.page.waitForEvent("filechooser");
+
+  // Click the menu item to trigger the file picker
+  await uploadItem.click();
+
+  // Handle the file chooser dialog
+  const fileChooser = await fileChooserPromise;
+  await fileChooser.setFiles("e2e-tests/fixtures/images/logo.png");
+
+  await po.sendPrompt(
+    "tc=local-agent/upload-image-to-codebase [[UPLOAD_IMAGE_TO_CODEBASE]]",
+    {
+      timeout: Timeout.EXTRA_LONG,
+    },
+  );
+
+  // Wait for the uploaded file card to render before snapshotting. Use .first()
+  // because the modified-files card at the bottom of the chat now also lists
+  // "file.png"; the attachment card is rendered above it, so it comes first.
+  await expect(
+    po.page.getByText("file.png", { exact: true }).first(),
+  ).toBeVisible();
+
   await po.snapshotMessages({ replaceDumpPath: true });
 
   // new/image/file.png
-  const appPath = await po.getCurrentAppPath();
+  const appPath = await po.appManagement.getCurrentAppPath();
   const filePath = path.join(appPath, "new", "image", "file.png");
   expect(fs.existsSync(filePath)).toBe(true);
   // check contents of filePath is equal in value to e2e-tests/fixtures/images/logo.png
@@ -75,7 +142,10 @@ test("attach image via drag - chat", async ({ po }) => {
     "base64",
   );
   // locate the inner drop target (first child div of the container)
-  const dropTarget = po.getChatInputContainer().locator("div").first();
+  const dropTarget = po.chatActions
+    .getChatInputContainer()
+    .locator("div")
+    .first();
   // simulate dragenter, dragover, and drop with a File
   await dropTarget.evaluate((element, fileBase64) => {
     // convert base64 to Uint8Array
@@ -96,9 +166,16 @@ test("attach image via drag - chat", async ({ po }) => {
     });
   }, fileBase64);
 
+  // Choose "Attach as chat context" in the attachment type dialog
+  const chatContextButton = po.page.getByRole("button", {
+    name: "Attach file as chat context",
+  });
+  await expect(chatContextButton).toBeVisible();
+  await chatContextButton.click();
+
   // submit and verify
   await po.sendPrompt("[dump]");
   // Note: this should match EXACTLY the server dump from the previous test.
-  await po.snapshotServerDump("last-message", { name: SNAPSHOT_NAME });
+  await po.snapshotServerDump("last-message", { name: CHAT_SNAPSHOT_NAME });
   await po.snapshotMessages({ replaceDumpPath: true });
 });
